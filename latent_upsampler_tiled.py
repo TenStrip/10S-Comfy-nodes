@@ -89,7 +89,6 @@ class LTXVLatentUpsamplerTiled:
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "upsample_latent_tiled"
     CATEGORY = "10S Nodes/Latent"
-    EXPERIMENTAL = True
     DESCRIPTION = (
         "Tiled drop-in replacement for LTXVLatentUpsampler. Solves color shifts and "
         "distortion at extreme aspect ratios by processing the upscale in spatial "
