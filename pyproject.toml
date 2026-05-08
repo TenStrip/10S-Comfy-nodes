@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-10s-nodes"
+version = "1.0.0"
+description = "Identity preservation, latent anchoring, and upscale-pass nodes for LTX2 video DiT"
+license = { text = "MIT" }
+
+[project.urls]
+Repository = "https://github.com/TenStrip/10S-Comfy-nodes"
+
+[tool.comfy]
+PublisherId = "TenStrip"
+DisplayName = "10S Nodes"
+Icon = ""
