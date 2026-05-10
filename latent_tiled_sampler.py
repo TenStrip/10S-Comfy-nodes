@@ -1,9 +1,39 @@
 """
-LTX Tiled Sampler v2.0
+LTX Tiled Sampler v2.2
 
 Spatially-tiled drop-in replacement for SamplerCustomAdvanced. Designed
 for upscale-pass refinement of LTX2 video latents where conditioning
 gets diluted at upscaled token counts.
+
+================================================================================
+CHANGES IN v2.2
+================================================================================
+- Fixed no-tile single-pass wrapper output: v2.1 passed guider.sample's
+  result through directly, but that wrapper has cached input refs in
+  .tensors slots (same as tile-path discovery from v2.0). Downstream
+  splitters that do latents[1] for audio hit IndexError because the
+  wrapper output ended up with only one tensor.
+- v2.2 applies the same x0-unflatten technique as the tile path's carrier
+  to extract both sampled video and audio from the no-tile sampling,
+  then reconstructs the wrapper for downstream compatibility.
+- Single sampling pass for video+audio is preserved (no extra steps).
+- Falls back gracefully: if x0 unflatten fails, tries _extract_components
+  on raw_result; if that fails, uses passthrough audio with input video.
+
+================================================================================
+CHANGES IN v2.1
+================================================================================
+- No-tile path now samples wrapper directly when audio is present.
+  Previously the auto-skip fallback ran video-only sampling, which meant
+  audio passed through unsampled — different behavior from what users
+  would get from standard SamplerCustomAdvanced. v2.1 mirrors stock
+  behavior in the no-tile case: video+audio sampled together in one
+  natural pass, wrapper output flows through unchanged.
+- New helper _single_pass_wrapper for this path. Preserves the original
+  wrapper object so downstream node compatibility (latents[1] access)
+  works without our flatten/unflatten machinery.
+- audio_pass / audio_carrier_tile settings are now correctly ignored in
+  the no-tile case (they only apply when tiling is actually happening).
 
 ================================================================================
 CHANGES IN v2.0
@@ -498,7 +528,7 @@ class LTXTiledSampler:
         raw_samples = latent["samples"]
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.0: input samples type="
+            print(f"\u2192 [10S] TiledSampler v2.2: input samples type="
                   f"{type(raw_samples).__name__} audio_pass={audio_pass}")
 
         # ─── Extract video, audio, and format info ───────────────────────────
@@ -507,7 +537,7 @@ class LTXTiledSampler:
                 raw_samples, debug=debug
             )
         except TypeError as e:
-            print(f"\u2192 [10S] TiledSampler v2.0: extraction failed:\n  {e}")
+            print(f"\u2192 [10S] TiledSampler v2.2: extraction failed:\n  {e}")
             raise
 
         latent_image_t = comfy.sample.fix_empty_latent_channels(
@@ -526,8 +556,11 @@ class LTXTiledSampler:
                 noise_mask = None
 
         if latent_image_t.dim() != 5:
-            print(f"\u2192 [10S] TiledSampler v2.0: extracted tensor is "
+            print(f"\u2192 [10S] TiledSampler v2.2: extracted tensor is "
                   f"{latent_image_t.dim()}D, expected 5D \u2014 single-pass")
+            # Restore wrapper if we had audio so single-pass samples both
+            if audio_tensor is not None:
+                latent["samples"] = raw_samples
             return self._single_pass(noise, guider, sampler, sigmas, latent,
                                      latent_image_t, noise_mask)
 
@@ -538,7 +571,7 @@ class LTXTiledSampler:
         axis_size = H if tile_axis == "H" else W
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.0: video shape="
+            print(f"\u2192 [10S] TiledSampler v2.2: video shape="
                   f"{tuple(latent_image_t.shape)} dtype={latent_image_t.dtype} "
                   f"axis={tile_axis} (size={axis_size})")
 
@@ -547,7 +580,24 @@ class LTXTiledSampler:
                 reason = (f"axis_size={axis_size} \u2264 {max_size_for_no_tile}"
                           if axis_size <= max_size_for_no_tile
                           else f"n_tiles={n_tiles}")
-                print(f"  \u00b7 single-pass ({reason})")
+                audio_note = (" with audio" if audio_tensor is not None
+                              else " (video only)")
+                print(f"  \u00b7 single-pass ({reason}){audio_note}")
+
+            # When not tiling AND audio is present, pass the ORIGINAL wrapper
+            # to guider.sample so video+audio are sampled together — exactly
+            # what would happen without this node. The wrapper output is
+            # extracted via x0 unflatten (same technique used by the tile
+            # path's carrier tile) and reconstructed for downstream nodes.
+            if audio_tensor is not None:
+                latent["samples"] = raw_samples
+                return self._single_pass_wrapper(
+                    noise, guider, sampler, sigmas, latent, noise_mask,
+                    video_tensor=latent_image_t,
+                    audio_tensor=audio_tensor,
+                    format_info=format_info,
+                    debug=debug,
+                )
             return self._single_pass(noise, guider, sampler, sigmas, latent,
                                      latent_image_t, noise_mask)
 
@@ -607,7 +657,7 @@ class LTXTiledSampler:
                         align_corners=False,
                     ).to(dtype=dtype, device=device)
                 except Exception as e:
-                    print(f"\u2192 [10S] TiledSampler v2.0: noise_mask resize failed "
+                    print(f"\u2192 [10S] TiledSampler v2.2: noise_mask resize failed "
                           f"({type(e).__name__}: {e}); using None")
                     noise_mask = None
                 if noise_mask is not None and added_channel_dim:
@@ -851,7 +901,7 @@ class LTXTiledSampler:
                         del sampled_audio
 
                 except Exception as e:
-                    print(f"\u2192 [10S] TiledSampler v2.0: carrier wrapper "
+                    print(f"\u2192 [10S] TiledSampler v2.2: carrier wrapper "
                           f"sampling failed ({type(e).__name__}: {e}); "
                           f"falling back to plain video for carrier tile")
                     x0_output.clear()
@@ -984,10 +1034,10 @@ class LTXTiledSampler:
         if debug:
             print(f"  \u00b7 final weight: min={wmin:.4f} max={wmax:.4f}")
         if wmin < 1e-3:
-            print(f"\u2192 [10S] TiledSampler v2.0: \u26a0  weight min={wmin:.4f} "
+            print(f"\u2192 [10S] TiledSampler v2.2: \u26a0  weight min={wmin:.4f} "
                   f"\u2014 unstable normalisation. Increase tile_overlap.")
         if wmax > 1.05:
-            print(f"\u2192 [10S] TiledSampler v2.0: \u26a0  weight max={wmax:.4f} > 1.05 "
+            print(f"\u2192 [10S] TiledSampler v2.2: \u26a0  weight max={wmax:.4f} > 1.05 "
                   f"\u2014 cosine fades not summing properly.")
 
         output = output / weights.clamp(min=1e-8)
@@ -1010,7 +1060,7 @@ class LTXTiledSampler:
             torch.cuda.empty_cache()
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.0: video output shape="
+            print(f"\u2192 [10S] TiledSampler v2.2: video output shape="
                   f"{tuple(output.shape)} dtype={output.dtype}")
 
         # ─── Audio handling ───────────────────────────────────────────────────
@@ -1028,10 +1078,10 @@ class LTXTiledSampler:
                 if captured_audio.shape == audio_tensor.shape:
                     output_audio = captured_audio
                     if debug:
-                        print(f"\u2192 [10S] TiledSampler v2.0: using carrier-tile "
+                        print(f"\u2192 [10S] TiledSampler v2.2: using carrier-tile "
                               f"audio shape={tuple(output_audio.shape)}")
                 else:
-                    print(f"\u2192 [10S] TiledSampler v2.0: \u26a0  carrier audio "
+                    print(f"\u2192 [10S] TiledSampler v2.2: \u26a0  carrier audio "
                           f"shape {tuple(captured_audio.shape)} != original "
                           f"{tuple(audio_tensor.shape)}; using passthrough audio")
             else:
@@ -1044,7 +1094,7 @@ class LTXTiledSampler:
                 denoised_output_final, output_audio, format_info, debug=debug
             )
         except Exception as e:
-            print(f"\u2192 [10S] TiledSampler v2.0: reconstruction failed "
+            print(f"\u2192 [10S] TiledSampler v2.2: reconstruction failed "
                   f"({type(e).__name__}: {e}); outputting tuple")
             reconstructed = (output, output_audio) if output_audio is not None else output
             denoised_reconstructed = (
@@ -1065,6 +1115,8 @@ class LTXTiledSampler:
     @staticmethod
     def _single_pass(noise, guider, sampler, sigmas, latent_dict,
                      latent_image_t, noise_mask):
+        """Plain video sampling (no audio). Used when latent has no audio
+        component or when extraction failed."""
         x0_output = {}
         callback = latent_preview.prepare_callback(
             guider.model_patcher, sigmas.shape[-1] - 1, x0_output
@@ -1092,6 +1144,155 @@ class LTXTiledSampler:
             )
         else:
             out_denoised = out
+        return (out, out_denoised)
+
+    @staticmethod
+    def _single_pass_wrapper(noise, guider, sampler, sigmas, latent_dict,
+                             noise_mask, video_tensor, audio_tensor,
+                             format_info, debug=False):
+        """
+        No-tile wrapper sampling. Samples video+audio together in a single
+        pass (mirrors standard SamplerCustomAdvanced semantics) but uses
+        the x0-unflatten technique to extract both sampled modalities and
+        reconstruct a downstream-compatible wrapper.
+
+        Args:
+            video_tensor : the extracted input video tensor (5D, used for
+                           shape reference during unflatten)
+            audio_tensor : the extracted input audio tensor (used for shape
+                           reference during unflatten, and as passthrough
+                           audio if extraction fails)
+            format_info  : wrapper format descriptor from _extract_components
+        """
+        if debug:
+            samples_type = type(latent_dict["samples"]).__name__
+            print(f"  \u00b7 [single_pass_wrapper] sampling full wrapper "
+                  f"type={samples_type}")
+
+        x0_output = {}
+        callback = latent_preview.prepare_callback(
+            guider.model_patcher, sigmas.shape[-1] - 1, x0_output
+        )
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        # Sample with the original wrapper
+        raw_result = guider.sample(
+            noise.generate_noise(latent_dict),
+            latent_dict["samples"],
+            sampler,
+            sigmas,
+            denoise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=noise.seed,
+        )
+
+        # ─── Extract sampled video + audio from x0 ────────────────────────────
+        # The raw_result wrapper has the cached input references in its
+        # .tensors slot (we proved this in v2.0). The actual sampled output
+        # is in x0_output["x0"] as a flat combined tensor that we need to
+        # unflatten.
+        sampled_video = None
+        sampled_audio = None
+
+        if "x0" in x0_output:
+            try:
+                x0_tensor = guider.model_patcher.model.process_latent_out(
+                    x0_output["x0"]
+                )
+                if debug:
+                    x0_shape = (
+                        tuple(x0_tensor.shape)
+                        if isinstance(x0_tensor, torch.Tensor)
+                        else type(x0_tensor).__name__
+                    )
+                    x0_numel = (
+                        x0_tensor.numel()
+                        if isinstance(x0_tensor, torch.Tensor)
+                        else 'n/a'
+                    )
+                    print(f"  \u00b7 [single_pass_wrapper] x0 after "
+                          f"process_latent_out: shape={x0_shape} numel={x0_numel}")
+                if isinstance(x0_tensor, torch.Tensor):
+                    unflat_v, unflat_a = _unflatten_ltx_combined(
+                        x0_tensor,
+                        expected_video_shape=video_tensor.shape,
+                        expected_audio_shape=audio_tensor.shape,
+                        debug=debug,
+                    )
+                    if unflat_v is not None:
+                        sampled_video = unflat_v
+                    if unflat_a is not None:
+                        sampled_audio = unflat_a
+            except Exception as e:
+                if debug:
+                    print(f"  \u00b7 [single_pass_wrapper] x0 extraction "
+                          f"failed: {type(e).__name__}: {e}")
+
+        # ─── Fallback: try extracting from raw_result wrapper ─────────────────
+        # If x0 unflatten failed, raw_result may have usable sampled audio
+        # in .tensors[1] even if .tensors[0] is the cached input video.
+        if sampled_video is None or sampled_audio is None:
+            try:
+                fallback_v, fallback_a, _ = _extract_components(raw_result, debug=False)
+                if sampled_video is None and fallback_v is not None and \
+                   fallback_v.shape == video_tensor.shape:
+                    sampled_video = fallback_v
+                if sampled_audio is None and fallback_a is not None and \
+                   fallback_a.shape == audio_tensor.shape:
+                    sampled_audio = fallback_a
+            except Exception as e:
+                if debug:
+                    print(f"  \u00b7 [single_pass_wrapper] fallback extract "
+                          f"failed: {type(e).__name__}: {e}")
+
+        # ─── Final fallbacks: passthrough on missing components ──────────────
+        if sampled_video is None:
+            if debug:
+                print(f"  \u00b7 [single_pass_wrapper] \u26a0  video extraction "
+                      f"failed; using INPUT video (sampling effectively no-op)")
+            sampled_video = video_tensor
+        if sampled_audio is None:
+            if debug:
+                print(f"  \u00b7 [single_pass_wrapper] using passthrough audio")
+            sampled_audio = audio_tensor
+
+        # Move to intermediate device for downstream
+        intermediate_device = comfy.model_management.intermediate_device()
+        sampled_video = sampled_video.to(
+            dtype=video_tensor.dtype, device=intermediate_device
+        )
+        sampled_audio = sampled_audio.to(
+            dtype=audio_tensor.dtype, device=intermediate_device
+        )
+
+        if debug:
+            print(f"  \u00b7 [single_pass_wrapper] sampled video shape="
+                  f"{tuple(sampled_video.shape)} audio shape="
+                  f"{tuple(sampled_audio.shape)}")
+
+        # ─── Reconstruct wrapper for downstream compatibility ────────────────
+        try:
+            reconstructed = _reconstruct_samples(
+                sampled_video, sampled_audio, format_info, debug=debug
+            )
+        except Exception as e:
+            if debug:
+                print(f"  \u00b7 [single_pass_wrapper] reconstruct failed "
+                      f"({type(e).__name__}: {e}); falling back to tuple")
+            reconstructed = (sampled_video, sampled_audio)
+
+        if debug:
+            print(f"  \u00b7 [single_pass_wrapper] output type="
+                  f"{type(reconstructed).__name__}")
+
+        out = latent_dict.copy()
+        out["samples"] = reconstructed
+
+        # Denoised output uses same reconstructed wrapper
+        out_denoised = latent_dict.copy()
+        out_denoised["samples"] = reconstructed
+
         return (out, out_denoised)
 
 
