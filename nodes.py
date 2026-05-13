@@ -351,8 +351,19 @@ class LatentTemporalInpainter:
         to focus on the ghost frames.
 
     score_gamma:
-        >1 (default 2.0) = concentrate noise on worst ghosts only.
-        <1 = spread correction broadly. Raise to 3-4 for heavily upsampled latents.
+        Controls how concentrated the ghost-score distribution becomes
+        before being mapped to per-frame sigma.
+        >1 (default 2.0) = concentrate noise on worst ghosts only. Raise to
+                           3-4 for heavily upsampled latents with severe
+                           interpolation artifacts.
+        =1               = use raw normalized residual scores directly.
+        <1 (0.1-0.5)     = aggressively flatten the distribution so even
+                           low-score frames get meaningful correction.
+                           Empirically useful when ghost frames span a
+                           wide range of severities and you want broad
+                           treatment rather than peak-focused correction.
+                           User reports 0.1, 0.2, 0.5 producing strong
+                           effects for certain content. Minimum 0.01.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -361,7 +372,7 @@ class LatentTemporalInpainter:
             "optional": {
                 "anchor_sigma":  ("FLOAT",   {"default": 0.05, "min": 0.0,  "max": 0.3,  "step": 0.01}),
                 "ghost_sigma":   ("FLOAT",   {"default": 0.35, "min": 0.05, "max": 0.80, "step": 0.01}),
-                "score_gamma":   ("FLOAT",   {"default": 2.0,  "min": 0.5,  "max": 5.0,  "step": 0.1}),
+                "score_gamma":   ("FLOAT",   {"default": 2.0,  "min": 0.01, "max": 5.0,  "step": 0.01}),
                 "anchor_blend":  ("FLOAT",   {"default": 0.4,  "min": 0.0,  "max": 1.0,  "step": 0.05}),
                 "seed":          ("INT",     {"default": 0,    "min": 0,    "max": 2**31, "step": 1}),
                 "debug_scores":  ("BOOLEAN", {"default": False}),
