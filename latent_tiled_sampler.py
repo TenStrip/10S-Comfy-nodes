@@ -501,21 +501,92 @@ class LTXTiledSampler:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "noise":        ("NOISE",),
-                "guider":       ("GUIDER",),
-                "sampler":      ("SAMPLER",),
-                "sigmas":       ("SIGMAS",),
-                "latent_image": ("LATENT",),
+                "noise":        ("NOISE", {
+                    "tooltip": "Noise generator from RandomNoise or similar. "
+                               "Wire from your existing noise source.",
+                }),
+                "guider":       ("GUIDER", {
+                    "tooltip": "CFG/STG guider wrapping the model. Wire from "
+                               "BasicGuider, CFGGuider, or LTX's STG guider.",
+                }),
+                "sampler":      ("SAMPLER", {
+                    "tooltip": "Sampling algorithm. euler_ancestral_cfg_pp "
+                               "recommended for LTX2 distilled CFG=1 setups.",
+                }),
+                "sigmas":       ("SIGMAS", {
+                    "tooltip": "Noise schedule. Typical upscale-pass schedule "
+                               "starts moderate (e.g. 0.85) with 3 active steps.",
+                }),
+                "latent_image": ("LATENT", {
+                    "tooltip": "Input latent. For upscale-pass refinement, "
+                               "this is typically the output of an upsampler.",
+                }),
             },
             "optional": {
-                "bypass_tiling":        ("BOOLEAN", {"default": False}),
-                "tile_axis":            (["auto", "H", "W"], {"default": "auto"}),
-                "n_tiles":              ("INT",     {"default": 2,  "min": 1, "max": 8,   "step": 1}),
-                "tile_overlap":         ("INT",     {"default": 8,  "min": 0, "max": 32,  "step": 1}),
-                "max_size_for_no_tile": ("INT",     {"default": 24, "min": 8, "max": 256, "step": 1}),
-                "audio_pass":           (["passthrough", "tile_carrying"], {"default": "passthrough"}),
-                "audio_carrier_tile":   (["first", "middle", "last"], {"default": "first"}),
-                "debug":                ("BOOLEAN", {"default": False}),
+                "bypass_tiling":        ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If True, route directly to standard single-pass "
+                               "sampling (video+audio together via wrapper). "
+                               "Equivalent to having no tiling at all. Useful "
+                               "for A/B comparison, small inputs that don't "
+                               "need tiling, or debugging whether issues are "
+                               "tile-related or sampling-related.",
+                }),
+                "tile_axis":            (["auto", "H", "W"], {
+                    "default": "auto",
+                    "tooltip": "Which spatial axis to tile along. 'auto' "
+                               "picks the longer axis (best for typical "
+                               "portrait/landscape aspects). Override to "
+                               "force tiling along H (vertical splits) or "
+                               "W (horizontal splits).",
+                }),
+                "n_tiles":              ("INT", {
+                    "default": 2, "min": 1, "max": 8, "step": 1,
+                    "tooltip": "Number of tiles along the chosen axis. "
+                               "Default 2 (split in halves) suits most "
+                               "aspect ratios. n_tiles=1 effectively disables "
+                               "tiling. Raise to 3-4 for very large outputs "
+                               "(4K+) along one axis.",
+                }),
+                "tile_overlap":         ("INT", {
+                    "default": 8, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "Overlap between adjacent tiles in latent "
+                               "tokens. Default 8 reliably hides seams. "
+                               "Reduce only if memory is constrained; "
+                               "smaller overlaps risk visible seams.",
+                }),
+                "max_size_for_no_tile": ("INT", {
+                    "default": 24, "min": 8, "max": 256, "step": 1,
+                    "tooltip": "Auto-skip tiling if the chosen-axis latent "
+                               "size is at or below this. 24 ≈ 768 pixels at "
+                               "32x VAE compression, well within model's "
+                               "comfort zone. Inputs at or below this skip "
+                               "tiling and run a single normal sampling pass.",
+                }),
+                "audio_pass":           (["passthrough", "tile_carrying"], {
+                    "default": "passthrough",
+                    "tooltip": "How to handle audio when input is video+audio "
+                               "wrapper. 'passthrough' (default): preserve "
+                               "original audio unchanged. 'tile_carrying': "
+                               "audio rides along with one chosen tile's "
+                               "sampling for proper video-audio cross-attention "
+                               "(lipsync). No extra sampling steps.",
+                }),
+                "audio_carrier_tile":   (["first", "middle", "last"], {
+                    "default": "first",
+                    "tooltip": "Which tile carries the audio when "
+                               "audio_pass=tile_carrying. 'first': top tile "
+                               "(ideal for vertical talking-face content "
+                               "where speaker is in upper half). 'middle': "
+                               "center tile (best for large outputs where "
+                               "subject is centered). 'last': bottom tile.",
+                }),
+                "debug":                ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Verbose per-tile diagnostic output. Helpful "
+                               "first time using the node to verify it's "
+                               "operating as expected.",
+                }),
             },
         }
 

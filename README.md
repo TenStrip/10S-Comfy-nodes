@@ -21,7 +21,13 @@ cd ComfyUI/custom_nodes/10S_Nodes
 git pull
 ```
 
-No external dependencies beyond ComfyUI's existing environment (PyTorch, comfy package). All nodes are pure Python.
+Optional dependency: **MediaPipe** is used by the Latent Face Detector for face bbox detection. Without it, the detector falls back to OpenCV's Haar cascades (less accurate). Install with:
+
+```bash
+pip install mediapipe
+```
+
+All other dependencies come from ComfyUI's existing environment (PyTorch, comfy package).
 
 ---
 
@@ -102,39 +108,116 @@ vae                  = [LTX VAE]
 
 ---
 
-## Supporting Nodes
+## Likeness Suite
 
-### 🪪 LTX Face Attention Anchor
+These nodes work together to provide face-region identity preservation for prompts the model already partially knows. **For unique faces unknown to the base model, a subject-specific LoRA trained via LTX-Video-Trainer (~30 images, ~15 minutes) provides significantly better quality than any inference-time method in this package.** The Likeness suite is best used as a complement to LoRA workflows for stabilization during difficult prompts (rapid expression changes, hard motion), or for faces the model partially recognizes.
+
+### 🎯 LTX Likeness Guide
 
 **Category:** `10S Nodes/Identity`
 
-Face-region identity preservation via per-block attention residual modification. Tracks a face bbox in the conditioning frame across all video frames using cosine-similarity correspondence in centered feature space. Pulls drifted face tokens back toward the anchor frame's identity features.
+Encodes a reference face into the conditioning pipeline. Auto-detects the face bbox via MediaPipe (with OpenCV Haar fallback), produces `reference_info` metadata that downstream nodes (LikenessAnchor, LikenessSemanticClamp) read from.
 
 **Key parameters:**
-- `face_bbox_norm` — normalized bbox `"x1,y1,x2,y2"` in [0,1] (default `"0.35,0.10,0.65,0.50"`)
-- `strength` — pull magnitude (typical 0.10-0.20)
-- `inject_mode` — `tracked` (general use) or `tracked_correction` (drift recovery for hard cuts)
-- `anchor_upsample` — bilinear upsample of anchor pool (default 2; raise to 3-4 for small-bbox composition)
-- `spatial_prior` — Gaussian falloff confining intervention to face vicinity (default 0.5)
-- `depth_curve` — per-block strength scaling: `flat` (default), `late_focus`, `ramp_up`, etc.
+- `image` (IMAGE) — reference face image
+- `vae` (VAE) — LTX VAE for encoding
+- `positive`, `negative` (CONDITIONING) — passed through with attention metadata
+- `emit_latent` — `passthrough` (default, recommended) or `extend_latent` (legacy)
+- `face_detect` — `auto` (MediaPipe→Haar fallback), `manual`, or `disabled`
+- `manual_face_bbox` — `"x1,y1,x2,y2"` normalized 0-1 when `face_detect=manual`
+- `reference_mask_mode` — `bbox_softfade` (default), `bbox_hard`, or `uniform`
 
-**General identity preservation:**
-```
-strength            = 0.10
-inject_mode         = tracked
-depth_curve         = flat
-spatial_prior       = 0.5
-anchor_upsample     = 2
-```
-
-**For hard scene cuts:**
-```
-strength            = 0.15
-inject_mode         = tracked_correction
-depth_curve         = late_focus
-```
+The `emit_latent=passthrough` default is critical: extending the latent triggers learned end-keyframe behavior in the model regardless of conditioning placement. Pass the guide's effects through `reference_info` instead.
 
 ---
+
+### 🪪 LTX Likeness Anchor
+
+**Category:** `10S Nodes/Identity`
+
+Per-block attn1 hook that pulls face-bbox video tokens toward reference identity features. Reads bbox from `reference_info` (LikenessGuide) or directly from `latent_frame_0`.
+
+**Key parameters:**
+- `model` (MODEL) — chain after LikenessGuide
+- `strength` — pull magnitude (typical 0.10-0.30)
+- `pull_mode` — `directional` (default, magnitude-preserving) or `additive` (legacy)
+- `reference_source` — `auto`, `guide`, or `latent_frame_0`
+- `sim_threshold` — cosine threshold for token matching (default 0.50)
+- `late_block_falloff` — strength reduction on last 12 blocks (default 0.0; raise to 0.3-0.4 if face appears rigid)
+- `depth_curve` — `flat` (default), `middle`, `late_focus`, `ramp_up`, `ramp_down`
+- `bypass` (BOOLEAN) — when True, properly removes prior hooks (no leak across runs)
+
+**Recommended config:**
+```
+strength            = 0.10-0.18
+pull_mode           = directional
+reference_source    = auto
+late_block_falloff  = 0.4
+depth_curve         = flat
+```
+
+**Important:** if chaining with Latent Anchor Aware (which also hooks attn1), the strengths *compound additively*. Each node's pull adds to the same attn1 residual. If using both, reduce individual strengths (e.g., AwareAnchor 0.08, LikenessAnchor 0.10 = combined effective ~0.18). At very high combined values, token-distribution variance can narrow visibly (color desaturation) — back off strength.
+
+---
+
+### 🪪 LTX Likeness Crop
+
+**Category:** `10S Nodes/Identity`
+
+Standalone face bbox cropper. Outputs cropped IMAGE of the detected face region plus the normalized bbox as STRING. Useful for previewing detection results or feeding face-only crops to other workflows.
+
+---
+
+### 🔎 LTX Latent Face Detector
+
+**Category:** `10S Nodes/Diagnostic`
+
+Standalone face detection node. Returns the normalized bbox as STRING (`"x1,y1,x2,y2"` format) for manual wiring into LikenessGuide's `manual_face_bbox` or LikenessAnchor's `override_face_bbox`. MediaPipe with OpenCV Haar fallback.
+
+---
+
+### 🧠 LTX Likeness Semantic Clamp ⚠ *experimental*
+
+**Category:** `10S Nodes/Identity`
+
+Semantic-aware text-token suppression for face-modifier vocabulary. Identifies which positive-prompt tokens are face-modifier-like (smiling, frowning, expressions) via embedding-space correspondence to a vocabulary, then selectively suppresses those tokens' attention contribution to face-bbox video tokens.
+
+**Status:** Experimental. The mechanism is sound but the LTX2 text encoder's contextual blending produces flatter token similarities than typical CLIP-style encoders, making correspondence search noisier than ideal. Works best with `auto_threshold=p95` adaptive thresholding. Effects are subtle on most prompts; may be more pronounced on prompts with explicit expression directives.
+
+**Key parameters:**
+- `clip` (CLIP) — same encoder that produced your positive conditioning
+- `positive` (CONDITIONING) — analyzed for face-modifier tokens
+- `reference_info` (REFERENCE_INFO) — wire from LikenessGuide for bbox
+- `suppression_strength` — 0.3-0.8 (default 0.5)
+- `face_modifier_text` — comma-separated modifier vocabulary (default works for common prompts)
+- `auto_threshold` — `p95` (default, recommended), `p98`, `p99`, or `disabled`
+- `suppression_floor` — hard cutoff below which weights become 0 (default 0.3)
+- `top_k` — confirming matches required (default 3)
+
+Diagnostic output shows the per-token suppression distribution; a healthy run shows ~3-8% of tokens getting strong suppression. If diagnostic shows >40% suppressed, the threshold is too low for your encoder; if <1%, too high.
+
+---
+
+### 💨 LTX Action Amplifier ⚠ *experimental*
+
+**Category:** `10S Nodes/Conditioning`
+
+Selectively amplifies action / motion verb tokens in the positive prompt to make i2v output more responsive to verb-driven motion. Symmetric inverse of LikenessSemanticClamp — same correspondence-search backbone, but boosts matched tokens rather than suppressing them.
+
+**Status:** Experimental. Replaces the deprecated blanket Text Amplifier approach with token-selective scaling. Capped boost ceiling (default `scale_ceiling=0.30`, so max +30% K/V scaling per matched token) keeps modifications controlled. Effect is subtle by design.
+
+**Key parameters:**
+- `clip` (CLIP), `positive` (CONDITIONING) — same as Semantic Clamp
+- `amplification_strength` — 0.0-1.0 (default 0.3)
+- `scale_ceiling` — maximum K/V scale factor delta (default 0.30 = max +30%)
+- `auto_threshold` — `p95` default
+- `action_vocabulary_text` — comma-separated verb vocabulary
+
+Unlike Semantic Clamp, this applies uniformly across all video tokens (no bbox) — actions affect the whole frame.
+
+---
+
+## Supporting Nodes
 
 ### 🎯 LTX Latent Anchor
 
@@ -160,27 +243,11 @@ For most cases the defaults work. Lower `max_size_for_no_tile` to force tiling o
 
 ---
 
-### 🔊 LTX Text Attention Amplifier
+### 🔊 LTX Text Attention Amplifier ⚠ *deprecated*
 
 **Category:** `10S Nodes/Identity`
 
-Modulates text cross-attention (`attn2`) influence per block. An alternative approach to the upscale-pass dilution problem (see Tiled Sampler), useful when tiling isn't appropriate. Bidirectional: < 1.0 suppresses text influence, > 1.0 amplifies.
-
-**Key parameters:**
-- `text_amplification` — multiplier (1.0 = no change; 1.2-1.5 typical for upscale dilution recovery; < 1.0 for suppression)
-- `spatial_focus` — 0.0 = uniform, > 0.0 = Gaussian-weighted with full amplification at center
-- `block_index_filter` — limit which blocks get the amplification
-
-**For upscale-pass dilution recovery (if not using Tiled Sampler):**
-```
-text_amplification = 1.30
-spatial_focus      = 0.0
-```
-
-**For reducing prompt over-fitting:**
-```
-text_amplification = 0.70
-```
+Original blanket text cross-attention amplifier. Multiplies attn2 output uniformly. **Deprecated** in favor of the token-selective Action Amplifier — blanket amplification was found to produce noise at meaningful strength values. Kept for backward compatibility with existing workflows.
 
 ---
 
@@ -220,29 +287,53 @@ LoadModel → LTX Latent Anchor Aware → KSampler → VAE Decode
             sigmas, reference_image, vae
 ```
 
-For face-targeted preservation, replace or chain with Face Attention Anchor: `Latent Anchor Aware → Face Anchor → KSampler`.
+For face-targeted preservation, chain the Likeness suite:
+
+```
+LikenessGuide(image) ──→ pos', neg', reference_info
+                              ↓
+LikenessAnchor(model, reference_info, strength=0.10-0.18, pull_mode=directional)
+                              ↓
+KSampler → VAE Decode
+```
+
+### Maximum identity preservation: LoRA + inference-time stabilization
+
+For unique faces (subjects unknown to the base model), the right approach is to train a subject-specific LoRA via Lightricks' [LTX-Video-Trainer](https://github.com/Lightricks/LTX-Video) (typically 30 images, ~15 minutes). Then use this package's nodes as a stabilization layer on top:
+
+```
+Base model + Subject LoRA
+        ↓
+LikenessGuide → LikenessAnchor → KSampler → VAE Decode
+```
+
+LoRA provides the identity; LikenessAnchor stabilizes against drift during difficult prompts. This combination produces better results than either approach alone.
 
 ### Combined identity + scene stabilization (chained)
 
 ```
-Model → LTX Latent Anchor Aware → LTX Face Attention Anchor → KSampler
+Model → LTX Latent Anchor Aware → LTX Likeness Anchor → KSampler
 ```
 
-All hook-based identity nodes coexist on the same model — different sentinel attributes prevent interference. Each can be bypassed independently.
+Both nodes hook `attn1` with different sentinel attributes — they coexist. Important: their pull strengths *compound additively*, so reduce individual strengths when chained (try AwareAnchor 0.08 + LikenessAnchor 0.10).
 
 ---
 
 ## Architecture Notes
 
-All identity nodes operate via PyTorch `register_forward_hook` on `transformer_blocks[i].attn1` (or `attn2` for Text Amplifier). Hooks return modified output tensors that flow forward to the next block's input.
+All identity nodes operate via PyTorch `register_forward_hook` on `transformer_blocks[i].attn1` (or `attn2` for the experimental token-selective nodes). Hooks return modified output tensors that flow forward to the next block's input.
 
 **Why hook intervention works:** LTX2's DiT is content-blind to its own intermediate states. Modifying attention output adds a residual that the rest of the block's computation (cross-attention, FFN) integrates naturally. Strength values that look small numerically (0.10-0.20) compound across 48 blocks per step into substantive effects.
+
+**The inference-time ceiling:** activation-level interventions can stabilize identity that the model already knows, but cannot impart new identity knowledge. For unique faces, a short LoRA training run (~15 minutes) imparts the identity at the weight level and produces dramatically better preservation. This package complements LoRA workflows rather than replacing them.
 
 **Per-frame centered cosine similarity** is used throughout for matching. Raw cosine similarity is dominated by common-mode features (positional encoding, scaffold features) that all tokens share. Subtracting the per-frame mean leaves identity-specific deviations that discriminate cleanly.
 
 **Cache-and-broadcast** (used by Latent Anchor Aware) snapshots the model's representation at peak conditioning alignment (mid-sampling) and uses it as a stable pull target. Conceptually adjacent to self-distillation and self-conditioning in diffusion, but operationalized as inference-time intervention rather than training-time signal.
 
 **Tiled Sampler architecture** does not use MultiDiffusion-style per-step coordination. Instead, each tile runs the full sampling pipeline as a standalone clip at training-distribution token count, then results blend with cosine windows. This works for light refinement passes (low denoise, few steps) where per-tile divergence is bounded. The carrier tile uses a single wrapper sampling pass for video and audio together — the model's video-audio cross-attention runs naturally during that pass, and we extract both modalities from the flattened combined output.
+
+**Bypass-safe hook management:** all hook-based nodes store PyTorch handle references and actively remove prior hooks when bypassed or re-applied. This prevents hooks from prior runs leaking into subsequent runs when `model.clone()` shares the underlying transformer blocks by reference.
 
 ---
 
@@ -251,10 +342,20 @@ All identity nodes operate via PyTorch `register_forward_hook` on `transformer_b
 - **LTX2-specific.** Hooks rely on `LTXAVModel.transformer_blocks` and `BasicAVTransformerBlock` structure. Will not work on other DiT-based video models without adaptation.
 - **Distilled CFG=1 setup tested most extensively.** Standard CFG works but compounds hook calls per step (cond + uncond passes), changing effective strength. Set `forwards_per_step=2` in advanced mode.
 - **Tiled Sampler is for light refinement only.** Heavy-denoise-from-noise generation produces tile divergence that the cosine blend can't reconcile. Use the full sampler for first-pass; tiled for upscale refinement only.
+- **Inference-time ceiling for unique faces.** Activation-level interventions stabilize known identity; they don't teach new identity. For unique faces unknown to the base model, train a LoRA. The Likeness suite is best as a stabilization complement to LoRA workflows.
 
 ---
 
 ## Version History
+
+**v1.6.0** — Likeness suite + experimental conditioning nodes
+- Added LTX Likeness Guide / Anchor / Crop (face-region identity preservation, complement to LoRA)
+- Added LTX Likeness Semantic Clamp (experimental, token-selective text-side suppression)
+- Added LTX Action Amplifier (experimental, token-selective verb amplification)
+- Added LTX Latent Face Detector (MediaPipe + OpenCV bbox detection)
+- Removed LTX Face Attention Anchor (replaced by the Likeness Anchor architecture)
+- Marked LTX Text Attention Amplifier as deprecated (blanket-scaling approach superseded by Action Amplifier's token-selective approach)
+- Bypass-safe hook management across all identity nodes (stored handles, active cleanup)
 
 **v1.2.0** — Audio-aware tiled sampling release
 - Added LTX Tiled Sampler v2.0 (whole-pipeline spatial tiling with carrier-tile audio capture for lipsync preservation)

@@ -1,0 +1,12 @@
+# 10S Nodes for ComfyUI — requirements
+#
+# All core dependencies are provided by ComfyUI's existing environment
+# (PyTorch, numpy, the comfy package). No additional required packages.
+#
+# Optional dependency:
+#   - mediapipe: improves face bbox detection accuracy in the Latent Face
+#     Detector and Likeness Guide nodes. Without it, falls back to OpenCV
+#     Haar cascades (already provided by ComfyUI).
+#
+# To enable MediaPipe, uncomment the line below or install separately:
+# mediapipe

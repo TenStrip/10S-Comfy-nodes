@@ -312,27 +312,125 @@ class LTXLatentAnchor:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL",),
+                "model": ("MODEL", {
+                    "tooltip": "LTX2 model to patch with per-block attention "
+                               "hooks. The returned model has the same "
+                               "behavior plus identity anchoring during "
+                               "sampling.",
+                }),
             },
             "optional": {
                 # ── Simple mode (always visible) ─────────────────────────────
-                "sigmas":               ("SIGMAS",),
-                "strength":             ("FLOAT",   {"default": 0.10, "min": 0.0,  "max": 5.0,  "step": 0.01}),
-                "cache_at_step":        ("INT",     {"default": 6,    "min": 0,    "max": 100,  "step": 1}),
-                "similarity_threshold": ("FLOAT",   {"default": 0.50, "min": 0.0,  "max": 1.0,  "step": 0.01}),
-                "decay_with_distance":  ("FLOAT",   {"default": 0.0,  "min": 0.0,  "max": 1.0,  "step": 0.05}),
-                "bypass":               ("BOOLEAN", {"default": False}),
+                "sigmas":               ("SIGMAS", {
+                    "tooltip": "Connect from your sigma scheduler (e.g. "
+                               "BasicScheduler, LTX's STG scheduler). Required "
+                               "for predictable cache timing — without it the "
+                               "node falls back to manual_calls mode which is "
+                               "less reliable.",
+                }),
+                "strength":             ("FLOAT", {
+                    "default": 0.10, "min": 0.0,  "max": 5.0,  "step": 0.01,
+                    "tooltip": "Magnitude of pull toward cached anchor state. "
+                               "0.05-0.15 typical. 0.10 is default. Higher "
+                               "values can over-damp motion or flatten "
+                               "frame-to-frame variation.",
+                }),
+                "cache_at_step":        ("INT", {
+                    "default": 6, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "Sampling step at which to lock the anchor "
+                               "(snapshot the model's representation as the "
+                               "stable target). Mid-sampling values (3-9 on "
+                               "13-step schedules) work best — peak "
+                               "conditioning alignment moment before fine "
+                               "refinement begins.",
+                }),
+                "similarity_threshold": ("FLOAT", {
+                    "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Minimum centered-cosine similarity for a "
+                               "token to receive pull. Lower = broader effect "
+                               "(more tokens pulled). 0.50 is balanced; raise "
+                               "to 0.60-0.70 to limit pull to most similar "
+                               "tokens only.",
+                }),
+                "decay_with_distance":  ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Per-frame strength decay from frame 0 "
+                               "(anchor frame) to last frame. 0 = uniform "
+                               "across all frames. 0.3-0.5 lets later frames "
+                               "drift more freely while keeping early frames "
+                               "anchored.",
+                }),
+                "bypass":               ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If True, the node passes the model through "
+                               "unchanged. Useful for A/B comparison without "
+                               "rewiring.",
+                }),
                 # ── Advanced mode (only used if advanced_mode=True) ──────────
-                "advanced_mode":        ("BOOLEAN", {"default": False}),
-                "cache_mode":           (["schedule", "live_extraction", "manual_calls"],
-                                         {"default": "schedule"}),
-                "forwards_per_step":    ("INT",     {"default": 1,    "min": 1,    "max": 8,    "step": 1}),
-                "cache_warmup":         ("INT",     {"default": 144,  "min": 0,    "max": 5000, "step": 1}),
-                "anchor_frame":         ("INT",     {"default": 0,    "min": 0,    "max": 256,  "step": 1}),
-                "depth_curve":          (["flat", "ramp_up", "ramp_down", "late_focus", "middle"],
-                                         {"default": "flat"}),
-                "block_index_filter":   ("STRING",  {"default": ""}),
-                "debug":                ("BOOLEAN", {"default": False}),
+                "advanced_mode":        ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Toggle to expose research/diagnostic "
+                               "parameters: cache_mode, forwards_per_step, "
+                               "cache_warmup, anchor_frame, depth_curve, "
+                               "block_index_filter, debug.",
+                }),
+                "cache_mode":           (["schedule", "live_extraction", "manual_calls"], {
+                    "default": "schedule",
+                    "tooltip": "How cache timing is determined. schedule "
+                               "(default, requires sigmas wired): cache fires "
+                               "at the sigma corresponding to cache_at_step. "
+                               "live_extraction: no cache, regenerate target "
+                               "every call (softer effect). manual_calls: "
+                               "cache fires after cache_warmup block calls "
+                               "(fallback when sigmas not wired).",
+                }),
+                "forwards_per_step":    ("INT", {
+                    "default": 1, "min": 1, "max": 8, "step": 1,
+                    "tooltip": "How many model forward passes occur per "
+                               "sampling step. 1 for distilled CFG=1 "
+                               "(typical). 2 for standard CFG > 1 (cond + "
+                               "uncond). 3+ for CFG+STG. Affects cache timing "
+                               "math when in schedule mode. Variable-CFG "
+                               "schedules use a single approximate value.",
+                }),
+                "cache_warmup":         ("INT", {
+                    "default": 144, "min": 0, "max": 5000, "step": 1,
+                    "tooltip": "Number of block calls before cache fires "
+                               "(when cache_mode=manual_calls). 144 ≈ 3 "
+                               "sampling steps × 48 blocks at CFG=1. Used as "
+                               "fallback when sigmas isn't connected.",
+                }),
+                "anchor_frame":         ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Which frame's features to use as anchor "
+                               "source. 0 = first frame (the conditioning "
+                               "frame in i2v workflows — recommended). Set "
+                               "higher to anchor to a different frame.",
+                }),
+                "depth_curve":          (["flat", "ramp_up", "ramp_down", "late_focus", "middle"], {
+                    "default": "flat",
+                    "tooltip": "Per-block strength scaling across the 48 "
+                               "transformer blocks. flat = uniform "
+                               "(recommended default). ramp_up = stronger "
+                               "late blocks (handles refinement). ramp_down "
+                               "= stronger early blocks (handles semantics). "
+                               "late_focus = quadratic late emphasis. "
+                               "middle = strongest in middle blocks.",
+                }),
+                "block_index_filter":   ("STRING", {
+                    "default": "",
+                    "tooltip": "Limit hooks to specific blocks, e.g. '10-30' "
+                               "or '5,7,15-20'. Empty = all 48 blocks. "
+                               "Useful for ablation studies; rarely needed "
+                               "in normal use.",
+                }),
+                "debug":                ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Verbose per-block diagnostic output during "
+                               "sampling. Shows cache state, similarity stats, "
+                               "and per-block timing. Helpful first time "
+                               "tuning a workflow.",
+                }),
             },
         }
 
