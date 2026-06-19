@@ -10,5 +10,5 @@ Repository = "https://github.com/TenStrip/10S-Comfy-nodes"
 
 [tool.comfy]
 PublisherId = "tenstrip"
-DisplayName = "10S Nodes"
+DisplayName = "10S-Comfy-nodes"
 Icon = ""
