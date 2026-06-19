@@ -103,6 +103,35 @@
 - **Status:** Deprecated. Blanket attn2 output multiplier produced noise at meaningful strengths. Superseded by Action Amplifier's token-selective approach. Kept for backward compatibility.
 - **Default:** `text_amplification=1.30, spatial_focus=0.0`
 
+### 🎯 STG Guider
+- **File:** `stg_guider.py`
+- **Class:** `LTX2STGGuider` (internal name preserved to avoid collision with Comfy's `STGGuider`); display name "STG Guider"
+- **Category:** `10S Nodes/Sampling`
+- **Role:** GUIDER node implementing Spatio-Temporal Guidance for LTX2
+- **Mechanism:** wraps `comfy.samplers.CFGGuider`. At each step:
+  - Pass 1: positive prediction
+  - Pass 2: negative prediction (when cfg ≠ 1)
+  - Pass 3: perturbed prediction — runs the model with self-attention V-shortcutted (returns V instead of softmax(QK)·V) on transformer blocks in `block_indices`
+  - Combines: `pred = pos + (cfg-1)·(pos-neg) + stg_scale·(pos-perturbed)`
+  - Optional per-step STD rescale: `pred · (rescale·pos.std/pred.std + (1-rescale))`
+- **Default config:**
+  - `cfg_per_step="2.0,1.5,1.0,1.0,..."` length must match sigmas
+  - `stg_scale_per_step="2.0,1.5,1.0,...,0.7,0.4,0.0,0.0"` taper to 0 in last steps
+  - `stg_rescale_per_step="1.0,..."`
+  - `block_indices="14, 19"` matches upstream Lightricks default
+  - Use `block_indices="9999"` to functionally disable STG
+- **Mode flags (per-signal):**
+  - `cfg_mode`, `stg_mode`, `stg_rescale_mode` ∈ {`per_step_list`, `sigma_curve`}
+  - `sigma_curve` mode: linear interpolation in sigma between `<signal>_max` (at sigma_max) and `<signal>_min` (at sigma=0)
+  - Each signal independently mode-switchable
+- **Critical implementation details:**
+  - Patches every transformer block via `set_model_patch_replace(_, "dit", "double_block", i)`, but only perturbs blocks listed in `target_block_indices` at runtime
+  - V-shortcut applies ONLY to the FIRST `optimized_attention` call per block (self-attention attn1). Subsequent calls (cross-attention attn2 with Q from text, K/V from video) fall through unmodified. This is enforced via per-block instance flag in `_PatchAttention`, plus shape guard `q.shape[1] == k.shape[1] == v.shape[1]`.
+  - Perturbing cross-attention causes shape mismatches with `_attention_with_guide_mask` and `adaLN` paths — guard is essential.
+  - Sigmas input MUST match the sampler's actual schedule (including any easing). Mismatch silently misaligns per-step parameters.
+- **Anchor compatibility:** anchors fire inside the model forward; STG guider orchestrates three forwards from outside the model. Anchors automatically fire on all three passes (positive, negative, perturbed) since their hooks are unconditional.
+- **Diagnostic mode:** when `debug=True`, the first perturbed pass logs which attention calls were V-shortcutted, with shape info — useful for verifying no cross-attention got perturbed accidentally.
+
 ### 🔍 LTX Latent Upsampler (Tiled)
 - **File:** `latent_upsampler_tiled.py`
 - **Drop-in for `LTXVLatentUpsampler`** with spatial tiling for extreme aspect ratios. Auto-detects upscale ratio (x1.5, x2). NOTE: empirical finding showed that the upscaler itself wasn't the source of color shift (the sampler operating on upscaled token counts was). This node remains useful as a memory-safer upscaler for very large inputs.
@@ -219,6 +248,49 @@ PyTorch hooks registered on `transformer_blocks[i].attn1` persist across `model.
 ### Finding 12: Latent extension triggers learned keyframe behavior regardless of conditioning
 
 Even when conditioning explicitly marks the appended frame as a silent reference, the *spatial pattern* of preserved content at the temporal end of the latent triggers learned end-keyframe behavior. LikenessGuide v1.4+ defaults to `emit_latent=passthrough` for this reason — the guide's effects flow through `reference_info` metadata, not through latent extension.
+
+### Finding 13: Anchors + Tiled Sampler produce tile-boundary artifacts
+
+**Empirical observation:** in two-pass workflows (anchors during first pass → tiled refinement), the second-pass output shows visible oversaturation / "burned features" in the tile region containing the anchor target (face). The artifact is deterministic with seed and worsens with aspect ratios where the anchor-affected content is concentrated in one tile.
+
+**Root cause (architectural, not a bug):** anchors operate per-forward-pass on whatever spatial extent the model receives. When Tiled Sampler slices the latent into tiles, each tile presented to the model is a sub-extent (e.g., (F=46, H=27, W=26) instead of full (F=46, H=46, W=26)). The anchor's hook fires per-tile with bbox normalization, similarity matching, and cached features computed in the tile's LOCAL coordinates. The anchor has no awareness it's processing a tile rather than a full latent.
+
+Even when anchors are placed ONLY in the first-pass branch (separate model from the Tiled Sampler), the first-pass *latent* carries the anchor's effect baked into its statistical distribution — variance contraction in the bbox region, deeper outlier tails from directional pull. This non-uniform distribution survives upscaling and creates tile-boundary statistical mismatch during tiled refinement.
+
+**Symptom signature:**
+- Tile containing face content: lower per-channel std, deeper negative outliers (saturated when VAE-decoded)
+- Other tiles: natural per-channel stats
+- Per-channel mean difference between tiles can be 2-3+ for affected channels
+
+**Failed mitigation attempt:** global per-channel mean/std matching across tiles (the rolled-back `match_tile_stats` option in Tiled Sampler v2.5). The artifact is spatially-localized within each tile (face bbox region only), so global per-channel matching is too coarse — it can't correct localized statistical pockets without spatial awareness.
+
+**Working mitigation (architectural):** use a two-model-branch workflow. One branch goes through anchors into first-pass sampler; a separate branch (clean model from the same MODEL source) goes into Tiled Sampler. The first-pass latent has the anchor's effect; the tiled refinement runs on a clean model. This is now documented as the standard pattern in README.
+
+### Finding 14: STG attention scope — self-attention only, never cross-attention
+
+**Empirical confirmation:** the V-shortcut perturbation (replacing `optimized_attention` with `return v`) MUST be limited to self-attention (attn1 — first attention call per block). Applying it to cross-attention (attn2 — second call, where Q is from text and K/V from video) causes:
+- Shape mismatch with LTX2's `_attention_with_guide_mask` paths (output sliced as `out[:, :guide_start, :]` expects specific shape that V doesn't match)
+- Shape mismatch with `adaLN` gating (output multiplied by Q-side gate that has text-token shape ~1024, while V has video-token shape ~10752)
+
+**Implementation:** STG Guider's `_PatchAttention` uses a per-block instance flag (`_first_call_done`) that flips True on the first attention call, plus a guard `q.shape[1] == k.shape[1] == v.shape[1]` that confirms self-attention by sequence-length equality. Cross-attention falls through to the original attention function.
+
+**Also confirmed:** the original Lightricks STG used `attn_idx=[0]` filtering which is implicitly "skip first attention call per block." Our implementation makes this explicit. STG fundamentally requires partial perturbation — perturbing ALL blocks (no `block_indices` filtering) produces catastrophically degraded output (dark grey, destroyed audio) because the perturbed prediction becomes mostly noise rather than a meaningfully different prediction.
+
+### Finding 15: STG late-step perturbation corrupts refined features
+
+**Empirical observation:** STG with constant `stg_scale > 0` throughout sampling produces oversaturation / burned features signature. Tapering `stg_scale_per_step` to 0.0 in the last ~30% of steps eliminates this.
+
+**Mechanism:** at high sigma (early sampling), the latent is mostly noise. The perturbed prediction (with self-attention skipped) is also mostly noise-like — the (pos - perturbed) difference encodes useful structural information. STG works as intended.
+
+At low sigma (late sampling), the latent has committed structure. The perturbed prediction is now a *sharp but broken* version of the refined image. The (pos - perturbed) difference encodes "how the refined image looks broken" — adding that signal to the noise prediction injects exactly the burned/dark artifacts. STG's mechanism (push away from broken reference) becomes counterproductive when the reference is broken in detail-relevant ways.
+
+**Recommended schedule:** STG active in first ~60-70% of steps (structure formation), taper to 0 in last 30% (detail refinement).
+
+### Finding 16: Sigma alignment between sampler and guider is critical
+
+**Empirical bug:** if the sampler runs on eased/normalized sigmas but the STG Guider's `sigmas` input is the original un-eased schedule, per-step parameter lookup silently misaligns. The guider's `_index_for_sigma()` finds the closest sigma in its list at-or-above the current step's actual sigma, but the un-eased and eased schedules differ — so the parameters applied don't match what the sampler thinks it's at.
+
+**Fix:** pass the EXACT same `SIGMAS` tensor to both the STG Guider and the sampler. Any normalization or easing nodes must be upstream of both. Documented as the primary "must do" in the STG Guider tooltip and docstring.
 
 ---
 
@@ -341,6 +413,63 @@ Mitigations:
 - Enable late_block_falloff=0.3-0.4
 - Tighten sim_threshold to pull fewer tokens
 - Confirm bypass actually clears prior hooks (Finding 11 — pre-v1.2 leak)
+```
+
+### Tiled Sampler output: first half oversaturated / "burned features" in tile 1
+
+```
+Cause: upstream anchors (LikenessAnchor / AwareAnchor / LatentAnchor) shaped the first-pass
+       latent into a non-uniform statistical distribution. The anchored region (typically
+       face bbox) has narrower per-channel variance and deeper outlier tails. This survives
+       upscaling and shows as visible saturation difference at tile boundaries (Finding 13).
+
+Diagnosis:
+- Enable debug=True on Tiled Sampler; compare tile 1's per-channel mean/std vs tile 2's.
+  If per-channel mean range differs by 2-3+ between tiles, anchor influence is confirmed.
+
+Fix (architectural — the right one):
+- Restructure workflow so the MODEL connects to TWO separate branches:
+  - Branch A: through anchors → first-pass sampler
+  - Branch B: clean (no anchors) → Tiled Sampler
+- The first-pass latent carries the anchor's effect; the upscale-pass refines clean
+
+NOT a fix:
+- Stat matching across tiles (rolled back as v2.5 match_tile_stats option) —
+  the artifact is spatially-localized within tiles, global per-channel matching can't fix it
+- Lower anchor strength alone — reduces but doesn't eliminate at strengths visible enough to help
+- More tile overlap — doesn't help, the difference is content-level
+```
+
+### STG output: oversaturation / burned features
+
+```
+Q: Are stg_scale values non-zero in the last 30% of steps?
+   YES → STG perturbing already-refined features (Finding 15)
+   Fix: taper stg_scale_per_step to 0.0 in last 4-5 steps of a 13-step schedule
+        Example: "2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.7, 0.4, 0.0, 0.0, 0.0, 0.0"
+
+Q: Is block_indices set to many blocks?
+   YES → Over-perturbation. The default "14, 19" is calibrated with stg_scale ~2.0.
+         More blocks ≈ more perturbation; reduce stg_scale proportionally or revert to default.
+
+Q: Do the sampler and guider receive the SAME sigmas?
+   Check: if you have a normalize/ease node between schedule and sampler, the guider
+   MUST receive the SAME post-easing sigmas (Finding 16).
+   Symptom of mismatch: STG values fire at wrong steps; produces unpredictable artifacts.
+```
+
+### STG appears to do nothing
+
+```
+Q: Is block_indices set to "9999" or similar out-of-range value?
+   YES → That's the explicit disable. STG perturbation is fully off.
+        Re-enable with "14, 19" (default) or other valid indices 0-47.
+
+Q: Are stg_scale_per_step values all 0.0?
+   YES → STG contribution is zero. Set non-zero values.
+
+Q: Is sigmas tensor empty or wrong length?
+   Check debug=True output. The guider's printed sigmas should match the sampler's.
 ```
 
 ---
@@ -595,18 +724,34 @@ Base model + Subject LoRA (trained via LTX-Video-Trainer, 30 images, 15 min)
 LikenessGuide → LikenessAnchor → KSampler → VAE Decode
 ```
 
-### Two-pass with upscale-pass quality recovery
+### Two-pass with upscale-pass quality recovery (CORRECTED — branch split)
+
 ```
-First-pass model → KSampler (first pass, normal SamplerCustomAdvanced)
-                ↓
-      LTX Latent Upsampler (Tiled)
-                ↓
-      Conditioning re-application
-                ↓
-      LTX Tiled Sampler (audio_pass=tile_carrying, audio_carrier_tile=first)
-                ↓
-      VAE Decode
+MODEL ─┬─→ LikenessAnchor / AwareAnchor → KSampler (first pass)
+       │                                       ↓
+       │                            [first-pass latent]
+       │                                       ↓
+       │                          LTX Latent Upsampler (Tiled)
+       │                                       ↓
+       │                          Conditioning re-application
+       │                                       ↓
+       └─→ (clean, NO anchors) → LTX Tiled Sampler (audio_pass=tile_carrying)
+                                                ↓
+                                           VAE Decode
 ```
+
+**Critical:** the MODEL source connects to TWO branches. Anchors go ONLY in the first-pass branch. The Tiled Sampler model is clean. See Finding 13 for why — anchors during tiled refinement produce visible tile-boundary artifacts. The first-pass latent carries the anchor's effect; the upscale-pass refines that latent with a clean model.
+
+### STG-augmented sampling (motion-heavy content)
+```
+Model → [optional: anchors] → STG Guider (sigmas, per-step lists) → SamplerCustomAdvanced (same sigmas)
+                                                                                ↓
+                                                                           VAE Decode
+```
+- Use in place of standard CFGGuider when motion quality matters
+- block_indices="14, 19" default — perturbs 2 mid-depth blocks
+- Taper stg_scale to 0 in last 30% of steps (Finding 15)
+- block_indices="9999" functionally disables STG while keeping CFG schedule
 
 ### Combined scene + face anchoring (advanced)
 ```
@@ -707,6 +852,7 @@ If a user reports an issue with terminology that suggests they're using an older
 - v1.2.3: bypass_tiling option
 - v1.5.0: LikenessClamp removed, SemanticClamp added
 - v1.6.0: Likeness suite, ActionAmplifier added, FaceAttentionAnchor removed, bypass-safe hook management
+- v1.7.0: STG Guider added (block-selective, per-step lists + sigma_curve modes), anchor+tile interaction documented (Finding 13), STG late-step taper documented (Finding 15), sigma-alignment requirement documented (Finding 16), Tiled Sampler v2.5 with diagnostic instrumentation
 
 ---
 

@@ -615,7 +615,7 @@ class LTXTiledSampler:
         raw_samples = latent["samples"]
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.3: input samples type="
+            print(f"\u2192 [10S] TiledSampler v2.5: input samples type="
                   f"{type(raw_samples).__name__} audio_pass={audio_pass} "
                   f"bypass_tiling={bypass_tiling}")
 
@@ -677,7 +677,7 @@ class LTXTiledSampler:
                 raw_samples, debug=debug
             )
         except TypeError as e:
-            print(f"\u2192 [10S] TiledSampler v2.3: extraction failed:\n  {e}")
+            print(f"\u2192 [10S] TiledSampler v2.5: extraction failed:\n  {e}")
             raise
 
         latent_image_t = comfy.sample.fix_empty_latent_channels(
@@ -696,7 +696,7 @@ class LTXTiledSampler:
                 noise_mask = None
 
         if latent_image_t.dim() != 5:
-            print(f"\u2192 [10S] TiledSampler v2.3: extracted tensor is "
+            print(f"\u2192 [10S] TiledSampler v2.5: extracted tensor is "
                   f"{latent_image_t.dim()}D, expected 5D \u2014 single-pass")
             # Restore wrapper if we had audio so single-pass samples both
             if audio_tensor is not None:
@@ -711,7 +711,7 @@ class LTXTiledSampler:
         axis_size = H if tile_axis == "H" else W
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.3: video shape="
+            print(f"\u2192 [10S] TiledSampler v2.5: video shape="
                   f"{tuple(latent_image_t.shape)} dtype={latent_image_t.dtype} "
                   f"axis={tile_axis} (size={axis_size})")
 
@@ -797,7 +797,7 @@ class LTXTiledSampler:
                         align_corners=False,
                     ).to(dtype=dtype, device=device)
                 except Exception as e:
-                    print(f"\u2192 [10S] TiledSampler v2.3: noise_mask resize failed "
+                    print(f"\u2192 [10S] TiledSampler v2.5: noise_mask resize failed "
                           f"({type(e).__name__}: {e}); using None")
                     noise_mask = None
                 if noise_mask is not None and added_channel_dim:
@@ -935,6 +935,33 @@ class LTXTiledSampler:
                     extracted_video = None
                     sampled_audio = None
 
+                    # ── Diagnostic: compare wrapper.tensors[0] against
+                    # our x0 capture. If Comfy fixed wrapper to return real
+                    # sampled output, .tensors[0] should now contain the
+                    # sampled video — different from our x0 capture.
+                    if debug:
+                        try:
+                            if hasattr(tile_result, "tensors"):
+                                w_v = tile_result.tensors[0]
+                                if isinstance(w_v, torch.Tensor):
+                                    wv_min = w_v.min().item()
+                                    wv_max = w_v.max().item()
+                                    wv_mean = w_v.mean().item()
+                                    wv_std = w_v.std().item()
+                                    print(f"    [carrier diag] "
+                                          f"wrapper.tensors[0]: "
+                                          f"shape={tuple(w_v.shape)} "
+                                          f"value_range=[{wv_min:.3f},"
+                                          f"{wv_max:.3f}] "
+                                          f"mean={wv_mean:.3f} "
+                                          f"std={wv_std:.3f}")
+                                    # If this is the SAMPLED video (not the
+                                    # input ref), its std should be similar
+                                    # to the x0-derived video.
+                        except Exception as e:
+                            print(f"    [carrier diag] could not inspect "
+                                  f"wrapper: {type(e).__name__}: {e}")
+
                     # Strategy 1: use the x0 capture's final state (the model's
                     # last denoised prediction). This typically contains the
                     # combined flat tensor that we can unflatten.
@@ -1041,7 +1068,7 @@ class LTXTiledSampler:
                         del sampled_audio
 
                 except Exception as e:
-                    print(f"\u2192 [10S] TiledSampler v2.3: carrier wrapper "
+                    print(f"\u2192 [10S] TiledSampler v2.5: carrier wrapper "
                           f"sampling failed ({type(e).__name__}: {e}); "
                           f"falling back to plain video for carrier tile")
                     x0_output.clear()
@@ -1064,6 +1091,42 @@ class LTXTiledSampler:
                     disable_pbar=disable_pbar,
                     seed=noise.seed,
                 )
+
+                # Diagnostic: log value range to compare against carrier tile.
+                # If carrier and non-carrier tiles produce outputs at
+                # meaningfully different scales, the blended output will
+                # show oversaturation in the carrier region.
+                if debug and isinstance(tile_samples, torch.Tensor):
+                    v_min = tile_samples.min().item()
+                    v_max = tile_samples.max().item()
+                    v_mean = tile_samples.mean().item()
+                    v_std = tile_samples.std().item()
+                    print(f"    [non-carrier] tile_samples direct: "
+                          f"shape={tuple(tile_samples.shape)} "
+                          f"value_range=[{v_min:.3f},{v_max:.3f}] "
+                          f"mean={v_mean:.3f} std={v_std:.3f}")
+
+                # ── Diagnostic check: does the non-carrier path's tile_result
+                # match what the x0 capture would have produced? If Comfy
+                # changed something about process_latent_out timing, these
+                # may differ — which is the smoking gun for our regression.
+                if debug and "x0" in x0_output:
+                    try:
+                        x0_proc = guider.model_patcher.model.process_latent_out(
+                            x0_output["x0"]
+                        )
+                        if isinstance(x0_proc, torch.Tensor):
+                            scale_ratio = (
+                                tile_samples.std().item()
+                                / max(x0_proc.std().item(), 1e-8)
+                            )
+                            print(f"    [non-carrier compare] "
+                                  f"tile_samples.std/x0_processed.std = "
+                                  f"{scale_ratio:.4f} "
+                                  f"(should be ~1.0 if same path)")
+                    except Exception as e:
+                        print(f"    [non-carrier compare] could not compare: "
+                              f"{type(e).__name__}: {e}")
 
             # Force tile output onto the accumulator's device. ComfyUI's
             # sampler can return samples on the intermediate device (often
@@ -1174,10 +1237,10 @@ class LTXTiledSampler:
         if debug:
             print(f"  \u00b7 final weight: min={wmin:.4f} max={wmax:.4f}")
         if wmin < 1e-3:
-            print(f"\u2192 [10S] TiledSampler v2.3: \u26a0  weight min={wmin:.4f} "
+            print(f"\u2192 [10S] TiledSampler v2.5: \u26a0  weight min={wmin:.4f} "
                   f"\u2014 unstable normalisation. Increase tile_overlap.")
         if wmax > 1.05:
-            print(f"\u2192 [10S] TiledSampler v2.3: \u26a0  weight max={wmax:.4f} > 1.05 "
+            print(f"\u2192 [10S] TiledSampler v2.5: \u26a0  weight max={wmax:.4f} > 1.05 "
                   f"\u2014 cosine fades not summing properly.")
 
         output = output / weights.clamp(min=1e-8)
@@ -1200,7 +1263,7 @@ class LTXTiledSampler:
             torch.cuda.empty_cache()
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.3: video output shape="
+            print(f"\u2192 [10S] TiledSampler v2.5: video output shape="
                   f"{tuple(output.shape)} dtype={output.dtype}")
 
         # ─── Audio handling ───────────────────────────────────────────────────
@@ -1218,10 +1281,10 @@ class LTXTiledSampler:
                 if captured_audio.shape == audio_tensor.shape:
                     output_audio = captured_audio
                     if debug:
-                        print(f"\u2192 [10S] TiledSampler v2.3: using carrier-tile "
+                        print(f"\u2192 [10S] TiledSampler v2.5: using carrier-tile "
                               f"audio shape={tuple(output_audio.shape)}")
                 else:
-                    print(f"\u2192 [10S] TiledSampler v2.3: \u26a0  carrier audio "
+                    print(f"\u2192 [10S] TiledSampler v2.5: \u26a0  carrier audio "
                           f"shape {tuple(captured_audio.shape)} != original "
                           f"{tuple(audio_tensor.shape)}; using passthrough audio")
             else:
@@ -1234,7 +1297,7 @@ class LTXTiledSampler:
                 denoised_output_final, output_audio, format_info, debug=debug
             )
         except Exception as e:
-            print(f"\u2192 [10S] TiledSampler v2.3: reconstruction failed "
+            print(f"\u2192 [10S] TiledSampler v2.5: reconstruction failed "
                   f"({type(e).__name__}: {e}); outputting tuple")
             reconstructed = (output, output_audio) if output_audio is not None else output
             denoised_reconstructed = (
