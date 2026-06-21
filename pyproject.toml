@@ -1,6 +1,6 @@
 [project]
 name = "10s-comfy-nodes"
-version = "1.7.1"
+version = "1.7.3"
 description = "Identity preservation, latent anchoring, upscale-pass quality, and STG guidance nodes for the LTX2 video diffusion model"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -10,5 +10,5 @@ Repository = "https://github.com/TenStrip/10S-Comfy-nodes"
 
 [tool.comfy]
 PublisherId = "tenstrip"
-DisplayName = "10S-Comfy-nodes"
+DisplayName = "10S Nodes"
 Icon = ""

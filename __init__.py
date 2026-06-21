@@ -9,6 +9,7 @@ from .latent_likeness_anchor         import NODE_CLASS_MAPPINGS as _NCM_LIKE_ANC
 from .latent_likeness_semantic_clamp import NODE_CLASS_MAPPINGS as _NCM_LIKE_SEM,      NODE_DISPLAY_NAME_MAPPINGS as _NDM_LIKE_SEM
 from .latent_action_amplifier        import NODE_CLASS_MAPPINGS as _NCM_ACT_AMP,       NODE_DISPLAY_NAME_MAPPINGS as _NDM_ACT_AMP
 from .stg_guider                     import NODE_CLASS_MAPPINGS as _NCM_STG,           NODE_DISPLAY_NAME_MAPPINGS as _NDM_STG
+from .lora_stack_av                  import NODE_CLASS_MAPPINGS as _NCM_LORA_STACK,    NODE_DISPLAY_NAME_MAPPINGS as _NDM_LORA_STACK
 from .latent_face_detector           import NODE_CLASS_MAPPINGS as _NCM_FACE_DETECT,   NODE_DISPLAY_NAME_MAPPINGS as _NDM_FACE_DETECT
 from .model_inspector                import NODE_CLASS_MAPPINGS as _NCM_INSPECT,       NODE_DISPLAY_NAME_MAPPINGS as _NDM_INSPECT
 
@@ -24,6 +25,7 @@ NODE_CLASS_MAPPINGS = {
     **_NCM_LIKE_SEM,
     **_NCM_ACT_AMP,
     **_NCM_STG,
+    **_NCM_LORA_STACK,
     **_NCM_FACE_DETECT,
     **_NCM_INSPECT,
 }
@@ -40,9 +42,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **_NDM_LIKE_SEM,
     **_NDM_ACT_AMP,
     **_NDM_STG,
+    **_NDM_LORA_STACK,
     **_NDM_FACE_DETECT,
     **_NDM_INSPECT,
 }
 
-__version__ = "1.7.0"
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', '__version__']
+__version__ = "1.7.3"
+WEB_DIRECTORY = "./web"
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY', '__version__']
