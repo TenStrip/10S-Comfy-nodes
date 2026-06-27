@@ -1,9 +1,35 @@
 """
-LTX Tiled Sampler v2.3
+LTX Tiled Sampler v2.6
 
 Spatially-tiled drop-in replacement for SamplerCustomAdvanced. Designed
 for upscale-pass refinement of LTX2 video latents where conditioning
 gets diluted at upscaled token counts.
+
+================================================================================
+CHANGES IN v2.6
+================================================================================
+- Fixed artifacts around guide frames when the input latent carries guide
+  keyframes from an LTXVAddGuide-family node (e.g. an added last frame).
+  Tiling now works WITH guides — run LTXVCropGuides after this node exactly
+  as in a non-tiled workflow.
+- Root cause: those nodes append the guide latent on the frame axis AND
+  store, in the conditioning, each guide token's position in FULL-FRAME
+  pixel coordinates ('keyframe_idxs'). The model overwrites the guide
+  tokens' positional coords with these values
+  (pixel_coords[:, :, -N:, :] = keyframe_idxs). Spatial tiling gives each
+  tile's video tokens tile-LOCAL coords, but keyframe_idxs still carried
+  full-frame coords and a full-frame token count, so every tile positioned
+  its guide tokens for the whole frame — corrupting the tile's positional
+  embedding and producing artifacts at the guide frame. bypass_tiling=True
+  avoided this only because a single full-frame pass keeps the coords valid.
+- v2.6 fix: before sampling each tile, rewrite keyframe_idxs (and any
+  guide_attention_entries) to the tile's spatial crop — slice the guide
+  grid to the tile's axis range and shift that axis's coordinate to the
+  tile-local origin so guide tokens line up with the tile's freshly
+  patchified video tokens. The guider's conditioning is restored to its
+  full-frame form after each tile, so downstream nodes (LTXVCropGuides)
+  see the original keyframe data and crop the guide frames normally.
+- Auto-detected and always on (only acts when keyframe_idxs is present).
 
 ================================================================================
 CHANGES IN v2.3
@@ -493,6 +519,197 @@ def _make_window_1d(size, fade_left, fade_right, dtype, device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Guide keyframe remapping (LTXVAddGuide compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Nodes in the LTXVAddGuide family (e.g. an added last frame) append the guide
+# latent on the frame axis and store, in the conditioning,
+# each guide token's position in FULL-FRAME pixel coordinates under the key
+# "keyframe_idxs" — a tensor of shape (B, 3, N, 2) over axes [t, h, w] with a
+# [start, end] pair on the last dim. Inside the model the guide tokens'
+# freshly-patchified positional coordinates are OVERWRITTEN by these stored
+# values (see comfy/ldm/lightricks/model.py _process_input:
+#   pixel_coords[:, :, -N:, :] = keyframe_idxs).
+#
+# When we tile spatially, each tile's video tokens get tile-LOCAL patchify
+# coordinates (origin 0), but keyframe_idxs still carries full-frame coords and
+# a full-frame token count. The model would then position the tile's guide
+# tokens for the whole frame, corrupting the tile's positional embedding and
+# producing artifacts at the guide frame. We fix this by rewriting keyframe_idxs
+# per tile: slicing the guide grid to the tile's axis range and shifting that
+# axis's coordinate to the tile-local origin so the guide tokens line up with
+# the tile's patchified video tokens.
+#
+# Guide tokens are flattened in (f, h, w) order with f most-significant, and the
+# guide frames are appended at the end of the frame axis, so the guide tokens
+# always occupy the tail of the patchified sequence — and a contiguous h-range
+# (or w-range) selection preserves that ordering, exactly matching how the model
+# patchifies the spatially-cropped tile.
+
+def _model_vae_scale_factors(guider):
+    """Best-effort retrieval of the LTXV model's (t, h, w) VAE scale factors,
+    used to convert tile latent offsets into the pixel space that
+    keyframe_idxs lives in. Falls back to the LTXV default (8, 32, 32)."""
+    try:
+        dm = guider.model_patcher.model.diffusion_model
+        sf = getattr(dm, "vae_scale_factors", None)
+        if sf is not None and len(sf) == 3:
+            return (int(sf[0]), int(sf[1]), int(sf[2]))
+    except Exception:
+        pass
+    return (8, 32, 32)
+
+
+def _collect_guide_conds(guider):
+    """Scan the guider's stored conditioning for guide keyframe data.
+
+    Returns (cond_dicts, keyframe_idxs, guide_attention_entries) where
+    cond_dicts is the list of cond entry dicts (across positive/negative/etc.)
+    that carry a keyframe_idxs value — we mutate these in place per tile and
+    restore them afterward. keyframe_idxs / guide_attention_entries are the
+    full-frame values (identical across entries by construction)."""
+    cond_dicts = []
+    keyframe_idxs = None
+    guide_attention_entries = None
+    conds = getattr(guider, "original_conds", None)
+    if not conds:
+        return cond_dicts, None, None
+    for k in conds:
+        for c in conds[k]:
+            if not isinstance(c, dict):
+                continue
+            if c.get("keyframe_idxs", None) is not None:
+                cond_dicts.append(c)
+                if keyframe_idxs is None:
+                    keyframe_idxs = c["keyframe_idxs"]
+                if guide_attention_entries is None and c.get("guide_attention_entries"):
+                    guide_attention_entries = c["guide_attention_entries"]
+    return cond_dicts, keyframe_idxs, guide_attention_entries
+
+
+def _remap_guide_entries(entries, keep, tile_axis, ax_start, ax_end,
+                         full_H, full_W):
+    """Rebuild guide_attention_entries for a tile crop.
+
+    The model validates that sum(pre_filter_count) == number of guide tokens
+    passed (raising ValueError otherwise), so per-tile counts MUST be updated.
+    Entries partition the guide-token sequence in append order; we count the
+    survivors of `keep` per entry, update latent_shape's tiled spatial dim, and
+    proportionally crop any pixel_mask along the tiled axis."""
+    out = []
+    offset = 0
+    for e in entries:
+        pfc = int(e.get("pre_filter_count", 0))
+        seg = keep[offset:offset + pfc]
+        surviving = int(seg.sum().item())
+        offset += pfc
+
+        ne = dict(e)
+        ne["pre_filter_count"] = surviving
+
+        ls = e.get("latent_shape")
+        if ls is not None and len(ls) == 3:
+            f_l, h_l, w_l = ls
+            if tile_axis == "H":
+                ne["latent_shape"] = [f_l, ax_end - ax_start, w_l]
+            else:
+                ne["latent_shape"] = [f_l, h_l, ax_end - ax_start]
+
+        pm = e.get("pixel_mask")
+        if isinstance(pm, torch.Tensor) and pm.dim() == 5:
+            # pixel_mask spatial dims may be at any resolution; crop the tiled
+            # axis proportionally to the tile's fraction of the full latent.
+            if tile_axis == "H":
+                pm_size = pm.shape[3]
+                p0 = int(round(ax_start / full_H * pm_size))
+                p1 = int(round(ax_end / full_H * pm_size))
+                ne["pixel_mask"] = pm[:, :, :, p0:p1, :]
+            else:
+                pm_size = pm.shape[4]
+                p0 = int(round(ax_start / full_W * pm_size))
+                p1 = int(round(ax_end / full_W * pm_size))
+                ne["pixel_mask"] = pm[:, :, :, :, p0:p1]
+
+        out.append(ne)
+    return out
+
+
+def _remap_keyframes_for_tile(keyframe_idxs, guide_attention_entries,
+                              full_H, full_W, tile_axis, ax_start, ax_end,
+                              spatial_scale, debug=False):
+    """Crop+shift full-frame keyframe_idxs to a tile's spatial range.
+
+    Returns (tile_keyframe_idxs, tile_guide_entries):
+      - cropped/shifted tensor (+ updated entries) when guide tokens fall in
+        the tile,
+      - (None, None) when none do (tile then samples with no guide tokens),
+      - the inputs unchanged if the grid can't be interpreted (safe no-op).
+    """
+    if not isinstance(keyframe_idxs, torch.Tensor) or keyframe_idxs.dim() != 4:
+        return keyframe_idxs, guide_attention_entries
+
+    N = keyframe_idxs.shape[2]
+    tokens_per_frame = full_H * full_W
+    if tokens_per_frame == 0 or N % tokens_per_frame != 0:
+        if debug:
+            print(f"    ⚠  [guide] keyframe token count {N} not a multiple "
+                  f"of H*W={tokens_per_frame}; leaving coords unmapped")
+        return keyframe_idxs, guide_attention_entries
+
+    device = keyframe_idxs.device
+    idx = torch.arange(N, device=device)
+    h_idx = (idx // full_W) % full_H
+    w_idx = idx % full_W
+
+    if tile_axis == "H":
+        keep = (h_idx >= ax_start) & (h_idx < ax_end)
+        axis_dim = 1  # [t, h, w] -> h
+    else:
+        keep = (w_idx >= ax_start) & (w_idx < ax_end)
+        axis_dim = 2  # [t, h, w] -> w
+
+    if not bool(keep.any()):
+        return None, None
+
+    tile_kf = keyframe_idxs[:, :, keep, :].clone()
+    # Shift the tiled axis (both start and end) to the tile-local origin.
+    tile_kf[:, axis_dim, :, :] = tile_kf[:, axis_dim, :, :] - ax_start * spatial_scale
+
+    tile_entries = None
+    if guide_attention_entries:
+        tile_entries = _remap_guide_entries(
+            guide_attention_entries, keep, tile_axis, ax_start, ax_end,
+            full_H, full_W,
+        )
+
+    return tile_kf, tile_entries
+
+
+def _apply_tile_keyframes(cond_dicts, tile_kf, tile_entries):
+    """Write per-tile keyframe data into the guider's cond dicts, returning a
+    snapshot for restoration. Guides share one keyframe_idxs across pos/neg."""
+    saved = []
+    for c in cond_dicts:
+        had_entries = "guide_attention_entries" in c
+        saved.append((c, c.get("keyframe_idxs", None),
+                      had_entries, c.get("guide_attention_entries", None)))
+        c["keyframe_idxs"] = tile_kf
+        if had_entries:
+            c["guide_attention_entries"] = tile_entries
+    return saved
+
+
+def _restore_keyframes(saved):
+    """Undo _apply_tile_keyframes so downstream nodes see full-frame guides."""
+    if not saved:
+        return
+    for c, old_kf, had_entries, old_entries in saved:
+        c["keyframe_idxs"] = old_kf
+        if had_entries:
+            c["guide_attention_entries"] = old_entries
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Node
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -615,7 +832,7 @@ class LTXTiledSampler:
         raw_samples = latent["samples"]
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.5: input samples type="
+            print(f"\u2192 [10S] TiledSampler v2.6: input samples type="
                   f"{type(raw_samples).__name__} audio_pass={audio_pass} "
                   f"bypass_tiling={bypass_tiling}")
 
@@ -677,7 +894,7 @@ class LTXTiledSampler:
                 raw_samples, debug=debug
             )
         except TypeError as e:
-            print(f"\u2192 [10S] TiledSampler v2.5: extraction failed:\n  {e}")
+            print(f"\u2192 [10S] TiledSampler v2.6: extraction failed:\n  {e}")
             raise
 
         latent_image_t = comfy.sample.fix_empty_latent_channels(
@@ -696,7 +913,7 @@ class LTXTiledSampler:
                 noise_mask = None
 
         if latent_image_t.dim() != 5:
-            print(f"\u2192 [10S] TiledSampler v2.5: extracted tensor is "
+            print(f"\u2192 [10S] TiledSampler v2.6: extracted tensor is "
                   f"{latent_image_t.dim()}D, expected 5D \u2014 single-pass")
             # Restore wrapper if we had audio so single-pass samples both
             if audio_tensor is not None:
@@ -711,7 +928,7 @@ class LTXTiledSampler:
         axis_size = H if tile_axis == "H" else W
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.5: video shape="
+            print(f"\u2192 [10S] TiledSampler v2.6: video shape="
                   f"{tuple(latent_image_t.shape)} dtype={latent_image_t.dtype} "
                   f"axis={tile_axis} (size={axis_size})")
 
@@ -746,6 +963,27 @@ class LTXTiledSampler:
             print(f"  \u00b7 n_tiles={n_tiles} tile_size={tile_size} "
                   f"overlap_param={tile_overlap}")
             print(f"  \u00b7 tile starts={starts}")
+
+        # \u2500\u2500\u2500 Guide keyframe detection (LTXVAddGuide family) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # If the conditioning carries keyframe_idxs (guide/last frame), the
+        # guide tokens' positions are stored in FULL-FRAME pixel coordinates and
+        # overwrite the model's per-tile patchify coords. Without remapping,
+        # every tile positions its guide tokens for the whole frame, producing
+        # artifacts at the guide frame. We remap per tile below. See the helper
+        # block above for the full explanation.
+        (guide_cond_dicts, guide_keyframe_idxs,
+         guide_attention_entries) = _collect_guide_conds(guider)
+        if guide_keyframe_idxs is not None:
+            _t_scale, h_scale, w_scale = _model_vae_scale_factors(guider)
+            guide_axis_scale = h_scale if tile_axis == "H" else w_scale
+            if debug:
+                print(f"  \u00b7 [guide] detected keyframe_idxs "
+                      f"shape={tuple(guide_keyframe_idxs.shape)}; will "
+                      f"remap per tile (axis={tile_axis} "
+                      f"scale={guide_axis_scale}, "
+                      f"{len(guide_cond_dicts)} cond entries)")
+        else:
+            guide_axis_scale = None
 
         full_noise = noise.generate_noise({"samples": latent_image_t})
         if debug:
@@ -797,7 +1035,7 @@ class LTXTiledSampler:
                         align_corners=False,
                     ).to(dtype=dtype, device=device)
                 except Exception as e:
-                    print(f"\u2192 [10S] TiledSampler v2.5: noise_mask resize failed "
+                    print(f"\u2192 [10S] TiledSampler v2.6: noise_mask resize failed "
                           f"({type(e).__name__}: {e}); using None")
                     noise_mask = None
                 if noise_mask is not None and added_channel_dim:
@@ -877,6 +1115,28 @@ class LTXTiledSampler:
                 print(f"  \u00b7 tile {tile_idx+1}/{len(starts)}{carrier_str}: "
                       f"axis_range=[{ax_start},{ax_end}) "
                       f"shape={tuple(tile_latent.shape)}")
+
+            # \u2500\u2500\u2500 Remap guide keyframes to this tile's spatial crop \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            # Rewrite keyframe_idxs (and guide_attention_entries) on the
+            # guider's conditioning so guide tokens align with the tile. Saved
+            # and restored at end of the iteration so downstream nodes
+            # (LTXVCropGuides) see the original full-frame guide data.
+            guide_saved = None
+            if guide_keyframe_idxs is not None:
+                tile_kf, tile_entries = _remap_keyframes_for_tile(
+                    guide_keyframe_idxs, guide_attention_entries,
+                    full_H=H, full_W=W, tile_axis=tile_axis,
+                    ax_start=ax_start, ax_end=ax_end,
+                    spatial_scale=guide_axis_scale, debug=debug,
+                )
+                guide_saved = _apply_tile_keyframes(
+                    guide_cond_dicts, tile_kf, tile_entries
+                )
+                if debug:
+                    n_tok = (tile_kf.shape[2]
+                             if isinstance(tile_kf, torch.Tensor) else 0)
+                    print(f"    [guide] tile keyframe tokens={n_tok} "
+                          f"(axis shift={ax_start * guide_axis_scale}px)")
 
             x0_output = {}
             callback = latent_preview.prepare_callback(
@@ -1068,7 +1328,7 @@ class LTXTiledSampler:
                         del sampled_audio
 
                 except Exception as e:
-                    print(f"\u2192 [10S] TiledSampler v2.5: carrier wrapper "
+                    print(f"\u2192 [10S] TiledSampler v2.6: carrier wrapper "
                           f"sampling failed ({type(e).__name__}: {e}); "
                           f"falling back to plain video for carrier tile")
                     x0_output.clear()
@@ -1218,6 +1478,14 @@ class LTXTiledSampler:
                       f"weight_acc: min={weights.min().item():.3f} "
                       f"max={weights.max().item():.3f}")
 
+            # ─── Restore full-frame guide keyframes on the conditioning ──────
+            # Undo this tile's keyframe remap so the next tile starts from the
+            # original full-frame guide data and downstream nodes
+            # (LTXVCropGuides) see the unmodified conditioning.
+            if guide_saved is not None:
+                _restore_keyframes(guide_saved)
+                guide_saved = None
+
             # ─── Memory cleanup between tiles ────────────────────────────────
             # Each tile holds substantial activation memory inside guider.sample.
             # Explicitly free per-tile intermediates and clear CUDA cache so the
@@ -1237,10 +1505,10 @@ class LTXTiledSampler:
         if debug:
             print(f"  \u00b7 final weight: min={wmin:.4f} max={wmax:.4f}")
         if wmin < 1e-3:
-            print(f"\u2192 [10S] TiledSampler v2.5: \u26a0  weight min={wmin:.4f} "
+            print(f"\u2192 [10S] TiledSampler v2.6: \u26a0  weight min={wmin:.4f} "
                   f"\u2014 unstable normalisation. Increase tile_overlap.")
         if wmax > 1.05:
-            print(f"\u2192 [10S] TiledSampler v2.5: \u26a0  weight max={wmax:.4f} > 1.05 "
+            print(f"\u2192 [10S] TiledSampler v2.6: \u26a0  weight max={wmax:.4f} > 1.05 "
                   f"\u2014 cosine fades not summing properly.")
 
         output = output / weights.clamp(min=1e-8)
@@ -1263,7 +1531,7 @@ class LTXTiledSampler:
             torch.cuda.empty_cache()
 
         if debug:
-            print(f"\u2192 [10S] TiledSampler v2.5: video output shape="
+            print(f"\u2192 [10S] TiledSampler v2.6: video output shape="
                   f"{tuple(output.shape)} dtype={output.dtype}")
 
         # ─── Audio handling ───────────────────────────────────────────────────
@@ -1281,10 +1549,10 @@ class LTXTiledSampler:
                 if captured_audio.shape == audio_tensor.shape:
                     output_audio = captured_audio
                     if debug:
-                        print(f"\u2192 [10S] TiledSampler v2.5: using carrier-tile "
+                        print(f"\u2192 [10S] TiledSampler v2.6: using carrier-tile "
                               f"audio shape={tuple(output_audio.shape)}")
                 else:
-                    print(f"\u2192 [10S] TiledSampler v2.5: \u26a0  carrier audio "
+                    print(f"\u2192 [10S] TiledSampler v2.6: \u26a0  carrier audio "
                           f"shape {tuple(captured_audio.shape)} != original "
                           f"{tuple(audio_tensor.shape)}; using passthrough audio")
             else:
@@ -1297,7 +1565,7 @@ class LTXTiledSampler:
                 denoised_output_final, output_audio, format_info, debug=debug
             )
         except Exception as e:
-            print(f"\u2192 [10S] TiledSampler v2.5: reconstruction failed "
+            print(f"\u2192 [10S] TiledSampler v2.6: reconstruction failed "
                   f"({type(e).__name__}: {e}); outputting tuple")
             reconstructed = (output, output_audio) if output_audio is not None else output
             denoised_reconstructed = (
