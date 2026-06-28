@@ -1,6 +1,6 @@
 [project]
 name = "10s-comfy-nodes"
-version = "1.9.0"
+version = "1.9.2"
 description = "Identity preservation, latent anchoring, upscale-pass quality, and STG guidance nodes for the LTX2 video diffusion model"
 license = { text = "MIT" }
 requires-python = ">=3.10"

@@ -14,7 +14,6 @@ from .lora_stack_av                  import NODE_CLASS_MAPPINGS as _NCM_LORA_STA
 from .latent_face_detector           import NODE_CLASS_MAPPINGS as _NCM_FACE_DETECT,   NODE_DISPLAY_NAME_MAPPINGS as _NDM_FACE_DETECT
 from .model_inspector                import NODE_CLASS_MAPPINGS as _NCM_INSPECT,       NODE_DISPLAY_NAME_MAPPINGS as _NDM_INSPECT
 from .model_forward_probe            import NODE_CLASS_MAPPINGS as _NCM_PROBE,         NODE_DISPLAY_NAME_MAPPINGS as _NDM_PROBE
-from .joyecho_image_to_memory        import NODE_CLASS_MAPPINGS as _NCM_JOYECHO_I2M,   NODE_DISPLAY_NAME_MAPPINGS as _NDM_JOYECHO_I2M
 from .ltx_reference_enable           import NODE_CLASS_MAPPINGS as _NCM_LTX_REF_EN,    NODE_DISPLAY_NAME_MAPPINGS as _NDM_LTX_REF_EN
 from .ltx_reference_conditioning     import NODE_CLASS_MAPPINGS as _NCM_LTX_REF_CND,   NODE_DISPLAY_NAME_MAPPINGS as _NDM_LTX_REF_CND
 
@@ -35,7 +34,6 @@ NODE_CLASS_MAPPINGS = {
     **_NCM_FACE_DETECT,
     **_NCM_INSPECT,
     **_NCM_PROBE,
-    **_NCM_JOYECHO_I2M,
     **_NCM_LTX_REF_EN,
     **_NCM_LTX_REF_CND,
 }
@@ -57,11 +55,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **_NDM_FACE_DETECT,
     **_NDM_INSPECT,
     **_NDM_PROBE,
-    **_NDM_JOYECHO_I2M,
     **_NDM_LTX_REF_EN,
     **_NDM_LTX_REF_CND,
 }
 
-__version__ = "1.9.0"
+__version__ = "1.9.2"
 WEB_DIRECTORY = "./web"
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY', '__version__']
