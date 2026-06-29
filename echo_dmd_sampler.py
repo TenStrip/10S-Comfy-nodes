@@ -17,11 +17,14 @@ Add to your NODE_CLASS_MAPPINGS / NODE_DISPLAY_NAME_MAPPINGS as usual.
 """
 
 from __future__ import annotations
+from tqdm.auto import tqdm
 
 import torch
 import comfy.samplers
 import comfy.sample
 import comfy.model_patcher
+import comfy.utils
+import time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,11 +277,18 @@ def _sample_echo_dmd(
     extra_args = extra_args or {}
     s_in = x.new_ones([x.shape[0]])
 
-    for i in range(len(sigmas) - 1):
+    steps = len(sigmas) - 1
+    pbar = comfy.utils.ProgressBar(steps)
+    pbar_tqdm = tqdm(total=steps, leave=True, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
+
+    for i in range(steps):
         sigma      = sigmas[i].item()
         sigma_next = sigmas[i + 1].item()
 
+        t0 = time.perf_counter()
         denoised = model(x, sigma * s_in, **extra_args)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
 
         if callback is not None:
             callback({
@@ -290,7 +300,14 @@ def _sample_echo_dmd(
             })
 
         x = _euler_dmd_step(x, sigma, sigma_next, denoised)
+        pbar_tqdm.update(1)
+        if elapsed >= 1.0:
+            pbar_tqdm.set_postfix({"s/it": f"{elapsed:.2f}"})
+        else:
+            pbar_tqdm.set_postfix({"it/s": f"{1/elapsed:.2f}"})
+        pbar.update(1)
 
+    pbar_tqdm.close()
     return x
 
 
