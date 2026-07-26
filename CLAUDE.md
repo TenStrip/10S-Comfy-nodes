@@ -505,6 +505,25 @@ Acts as transparent passthrough to single-pass sampling.
 
 ## KNOWN COMPATIBILITY ISSUES
 
+### LATENT_UPSCALE_MODEL may be a ModelPatcher OR a bare nn.Module
+Both shapes are live, so never assume one. ComfyUI commit `f8a3fd9` ("upscalers:
+convert latent_upsampler model to DynamicVram", PR #15063, 2026-07-24) makes
+`LatentUpscaleModelLoader` wrap the `LatentUpsampler` in a `CoreModelPatcher`
+(→ `ModelPatcherDynamic` when DynamicVRAM is active). That commit is on master and
+ships in some builds, but is NOT in tagged v0.28.3, which still returns a bare
+module — so the same node can see either shape depending on the build. Note also
+that the Hunyuan 720p/1080p branches of the loader return a bare module even on
+builds that have the patcher. Patchers are not callable and
+expose no `.parameters()` / `.to()` / `.cpu()` / `.state_dict()`, so the old handling
+raises `AttributeError: 'ModelPatcherDynamic' object has no attribute 'parameters'`.
+Correct access: `patcher.model` (callable module), `patcher.load_device`,
+`patcher.model_dtype()`, and `model_management.load_models_gpu([patcher], memory_required=…)`
+for residency — never manual `.to()`/`.cpu()`, which fights the memory manager.
+Note `model_dtype()` returns `None` for `LatentUpsampler` (no `get_dtype` method); fall
+back to `next(module.parameters()).dtype` to keep the bf16 cast. Handled by
+`_resolve_upscale_model()` in `latent_upsampler_tiled.py` (v1.2), which supports both
+the patcher and legacy bare-module shapes.
+
 ### Blackwell GPUs (compute capability ≥ 12.0)
 - xformers may lack Blackwell support → attention errors during sampling
 - Fix: `--use-pytorch-cross-attention` on ComfyUI launch

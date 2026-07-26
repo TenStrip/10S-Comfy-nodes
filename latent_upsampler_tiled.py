@@ -1,5 +1,5 @@
 """
-LTX Latent Upsampler Tiled v1.0
+LTX Latent Upsampler Tiled v1.2
 
 Drop-in replacement for ComfyUI's LTXVLatentUpsampler that tiles the
 spatial dimension when input is large enough to trigger the upscale
@@ -56,11 +56,77 @@ PARAMETERS
                            upscale. Default 32. Set lower to force tiling
                            on smaller inputs (rarely needed).
   debug                  : Print tile counts and per-tile diagnostics.
+
+================================================================================
+COMPATIBILITY
+================================================================================
+v1.2: ComfyUI 0.28.0 changed LatentUpscaleModelLoader to return a ModelPatcher
+(CoreModelPatcher / ModelPatcherDynamic under DynamicVRAM) rather than a bare
+nn.Module. The model handle is resolved through _resolve_upscale_model(), which
+supports both shapes; residency on the patcher path is delegated to
+model_management.load_models_gpu instead of manual .to()/.cpu() calls.
 """
 
 import math
 import torch
 from comfy import model_management
+
+
+def _resolve_upscale_model(upscale_model, latents):
+    """
+    Normalize the LATENT_UPSCALE_MODEL input into a callable module plus its
+    device/dtype, handling both shapes the loader has returned over time.
+
+    ComfyUI 0.28.0's LatentUpscaleModelLoader wraps the LatentUpsampler in a
+    ModelPatcher (CoreModelPatcher / ModelPatcherDynamic under DynamicVRAM).
+    Patchers are not callable and expose no .parameters()/.to()/.cpu(), so
+    residency is handed to model_management instead of moved by hand.
+    Older builds returned a bare nn.Module, which we still support.
+
+    Returns (module, device, dtype, load_fn, unload_fn).
+    """
+    is_patcher = hasattr(upscale_model, "model") and hasattr(upscale_model, "load_device")
+
+    if is_patcher:
+        module = upscale_model.model
+        device = upscale_model.load_device
+
+        # model_dtype() returns None for LatentUpsampler (no get_dtype method),
+        # so the parameter-dtype fallback is load-bearing: it preserves the
+        # bf16 cast this node has always done for the un-normalized latents.
+        dtype = None
+        model_dtype = getattr(upscale_model, "model_dtype", None)
+        if callable(model_dtype):
+            dtype = model_dtype()
+
+        def load_fn(memory_required):
+            model_management.load_models_gpu(
+                [upscale_model], memory_required=memory_required
+            )
+
+        def unload_fn():
+            pass  # residency is model_management's call, not ours
+    else:
+        module = upscale_model
+        device = model_management.get_torch_device()
+        dtype = None
+
+        def load_fn(memory_required):
+            model_management.free_memory(
+                memory_required + model_management.module_size(module), device
+            )
+            module.to(device)
+
+        def unload_fn():
+            module.cpu()
+
+    if dtype is None:
+        try:
+            dtype = next(module.parameters()).dtype
+        except StopIteration:
+            dtype = latents.dtype
+
+    return module, device, dtype, load_fn, unload_fn
 
 
 class LTXVLatentUpsamplerTiled:
@@ -102,11 +168,13 @@ class LTXVLatentUpsamplerTiled:
                               max_size_for_no_tile=32,
                               rotate_for_landscape=False,
                               debug=False):
-        device = model_management.get_torch_device()
-        model_dtype = next(upscale_model.parameters()).dtype
         latents = samples["samples"]
         input_dtype = latents.dtype
         B, C, F, H, W = latents.shape
+
+        model, device, model_dtype, load_fn, unload_fn = _resolve_upscale_model(
+            upscale_model, latents
+        )
 
         if debug:
             print(f"\u2192 [10S] LatentUpsamplerTiled: input shape={tuple(latents.shape)} "
@@ -117,16 +185,17 @@ class LTXVLatentUpsamplerTiled:
                   f"clamping overlap to {tile_size - 1}")
             overlap = max(1, tile_size - 1)
 
-        # Memory estimate — only one tile in memory at a time, plus accumulators
-        memory_required = model_management.module_size(upscale_model)
+        # Working-set estimate — only one tile in memory at a time, plus
+        # accumulators. Weight memory is accounted for by the loader itself.
         tile_volume = B * C * F * (tile_size * 2) ** 2
         output_volume = B * C * F * (H * 2) * (W * 2)
-        memory_required += tile_volume * 3000.0
+        memory_required = tile_volume * 3000.0
         memory_required += output_volume * 4.0  # fp32 accumulator
-        model_management.free_memory(memory_required, device)
 
         try:
-            upscale_model.to(device)
+            # Loaded inside the try so a failure part-way through (e.g. OOM in
+            # the legacy path's .to(device)) still reaches unload_fn().
+            load_fn(memory_required)
 
             # Un-normalize ONCE on full latent (global per-channel statistics)
             latents_dev = latents.to(dtype=model_dtype, device=device)
@@ -155,13 +224,13 @@ class LTXVLatentUpsamplerTiled:
                 if debug:
                     print(f"  \u00b7 H={H} W={W} both \u2264 max_size_for_no_tile="
                           f"{max_size_for_no_tile}; using non-tiled path")
-                upsampled = upscale_model(latents_un)
+                upsampled = model(latents_un)
             else:
                 if debug:
                     print(f"  \u00b7 tiling triggered: H={H} > {max_size_for_no_tile} "
                           f"or W={W} > {max_size_for_no_tile}")
                 upsampled = self._upsample_tiled(
-                    latents_un, upscale_model, tile_size, overlap, debug
+                    latents_un, model, tile_size, overlap, debug
                 )
 
             # Rotate back if we rotated
@@ -173,7 +242,7 @@ class LTXVLatentUpsamplerTiled:
             # Re-normalize ONCE on full output
             upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
         finally:
-            upscale_model.cpu()
+            unload_fn()
 
         upsampled = upsampled.to(
             dtype=input_dtype,
@@ -190,10 +259,13 @@ class LTXVLatentUpsamplerTiled:
 
     # ─── Core tiled upscale ─────────────────────────────────────────────────
 
-    def _upsample_tiled(self, latents, upscale_model, tile_size, overlap, debug):
+    def _upsample_tiled(self, latents, model, tile_size, overlap, debug):
         """
         Spatial tiling with cosine-windowed overlap blending.
         Frames processed together per tile (preserves temporal consistency).
+
+        `model` is the raw callable nn.Module, already resolved out of any
+        ModelPatcher wrapper and resident on device by the caller.
 
         v1.1 fixes:
           - Auto-detect upscale ratio from first tile (supports x1.5, x2, x4 etc.)
@@ -231,7 +303,7 @@ class LTXVLatentUpsamplerTiled:
         h0_end = min(h_starts[0] + tile_size, H)
         w0_end = min(w_starts[0] + tile_size, W)
         first_tile_in = latents[:, :, :, h_starts[0]:h0_end, w_starts[0]:w0_end].contiguous()
-        first_tile_out = upscale_model(first_tile_in)
+        first_tile_out = model(first_tile_in)
 
         # Detect actual scale (could be 2.0, 1.5, etc.)
         scale_h = first_tile_out.shape[3] / first_tile_in.shape[3]
@@ -276,7 +348,7 @@ class LTXVLatentUpsamplerTiled:
                     tile_in_shape = first_tile_in.shape
                 else:
                     tile_in = latents[:, :, :, h_start:h_end, w_start:w_end].contiguous()
-                    tile_out = upscale_model(tile_in)
+                    tile_out = model(tile_in)
                     tile_in_shape = tile_in.shape
 
                 # Output positions — use actual tile_out shape, not assumed

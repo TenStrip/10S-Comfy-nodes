@@ -234,6 +234,12 @@ Reference tokens (sequence-input intervention) and latent anchors (mid-forward a
 
 ## Version History
 
+**v1.9.6** — ComfyUI 0.28.0 compatibility fix
+- Fixed `AttributeError: 'ModelPatcherDynamic' object has no attribute 'parameters'` in LTX Latent Upsampler (Tiled)
+- ComfyUI 0.28.0 changed `LatentUpscaleModelLoader` to return a ModelPatcher rather than a bare `nn.Module`
+- Latent Upsampler Tiled v1.2 — model handle resolved through `_resolve_upscale_model()`; residency delegated to `model_management.load_models_gpu`
+- Backward compatible with pre-0.28 ComfyUI (legacy bare-module path retained)
+
 **v1.9.4** — LTX Face Identity Reinforcer (Best-Face-ID i2v integration)
 - Added LTXFaceIdentityReinforcer — single-node identity reinforcer for the LTX-Best-Face-ID LoRA
 - Full mechanism implementation per creator's spec: overlap coordinate placement + per-dimension RoPE phase rotation
