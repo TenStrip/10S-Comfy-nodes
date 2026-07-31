@@ -50,6 +50,7 @@ from typing import Any, Dict, Optional
 _PATCHES_APPLIED = False
 _ORIGINAL_PROCESS_INPUT = None
 _ORIGINAL_PREPARE_TIMESTEP = None
+_ORIGINAL_PROCESS_OUTPUT = None
 _PATCH_ERROR: Optional[str] = None
 _CALL_COUNTER = 0
 _VERBOSE = False  # Set True for debug logging
@@ -735,6 +736,7 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
     additional_args["reference_frames"] = ref_frames
     additional_args["target_seq_len"] = target_seq_len
     additional_args["target_frames"] = target_frames
+
     self._pending_ref_seq_len = ref_seq_len
     self._pending_source_id = source_id
     self._pending_phase_scale = phase_scale
@@ -1037,6 +1039,31 @@ def _describe_slot(obj, idx, prefix="    "):
 
 # ── Patchifier unpatchify wrap (instance-level) ────────────────────────────
 
+def _patched_process_output(self, x, embedded_timestep, keyframe_idxs, **kwargs):
+    """Remove the reference prefix before ComfyUI restores keyframe tokens."""
+    ref_seq_len = int(kwargs.get("reference_seq_len", 0) or 0)
+    if ref_seq_len > 0:
+        combined_seq_len = x.shape[1]
+
+        if (
+            isinstance(embedded_timestep, torch.Tensor)
+            and embedded_timestep.dim() >= 2
+            and embedded_timestep.shape[1] == combined_seq_len
+        ):
+            embedded_timestep = embedded_timestep[:, ref_seq_len:, ...]
+
+        x = x[:, ref_seq_len:, ...]
+
+        # The output prefix has already been removed, so prevent the legacy
+        # unpatchify wrapper from stripping the target a second time.
+        self._pending_ref_seq_len = 0
+
+    return _ORIGINAL_PROCESS_OUTPUT(
+        self, x, embedded_timestep, keyframe_idxs, **kwargs
+    )
+
+
+
 class _UnpatchifyWrapper:
     """Strip reference prefix from output before reshape."""
     def __init__(self, original_unpatchify, model_ref):
@@ -1064,20 +1091,24 @@ def _apply_patchifier_wrap(model_instance):
 
 def apply_global_patches():
     """Apply class-level patches to LTXAVModel. Idempotent."""
-    global _PATCHES_APPLIED, _ORIGINAL_PROCESS_INPUT, _ORIGINAL_PREPARE_TIMESTEP, _PATCH_ERROR
+    global _PATCHES_APPLIED, _ORIGINAL_PROCESS_INPUT, _ORIGINAL_PREPARE_TIMESTEP
+    global _ORIGINAL_PROCESS_OUTPUT, _PATCH_ERROR
 
     if _PATCHES_APPLIED:
         return True
 
     try:
-        av_module, _model_module, _coords_fn = _import_comfy()
+        av_module, model_module, _coords_fn = _import_comfy()
         LTXAVModel = av_module.LTXAVModel
+        LTXVModel = model_module.LTXVModel
 
         _ORIGINAL_PROCESS_INPUT = LTXAVModel._process_input
         _ORIGINAL_PREPARE_TIMESTEP = LTXAVModel._prepare_timestep
+        _ORIGINAL_PROCESS_OUTPUT = LTXVModel._process_output
 
         LTXAVModel._process_input = _patched_process_input
         LTXAVModel._prepare_timestep = _patched_prepare_timestep
+        LTXVModel._process_output = _patched_process_output
 
         # v2: patch _prepare_positional_embeddings on LTXAVModel itself.
         # Prior code walked MRO to find first owner, but if LTXAVModel overrides
