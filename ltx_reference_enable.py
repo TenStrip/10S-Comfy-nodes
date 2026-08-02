@@ -50,6 +50,7 @@ from typing import Any, Dict, Optional
 _PATCHES_APPLIED = False
 _ORIGINAL_PROCESS_INPUT = None
 _ORIGINAL_PREPARE_TIMESTEP = None
+_ORIGINAL_PROCESS_OUTPUT = None
 _PATCH_ERROR: Optional[str] = None
 _CALL_COUNTER = 0
 _VERBOSE = False  # Set True for debug logging
@@ -958,6 +959,32 @@ def _patched_prepare_timestep(self, timestep, batch_size, hidden_dtype, **kwargs
     return tuple(result_list) if was_tuple else result_list
 
 
+def _patched_process_output(self, x, embedded_timestep, keyframe_idxs, **kwargs):
+    """Remove reference tokens before LTX reconstructs keyframe outputs.
+
+    LTXVModel._process_input first filters guide tokens using ``grid_mask``.
+    The Face ID patch then prepends reference tokens to that filtered stream.
+    LTXVModel._process_output must therefore remove the prefix before its
+    keyframe scatter; the patchifier unpatchify wrapper is too late because
+    the scatter already assumes the original token count.
+    """
+    ref_seq_len = int(getattr(self, "_pending_ref_seq_len", 0) or 0)
+    if ref_seq_len > 0:
+        if isinstance(x, torch.Tensor) and x.dim() == 3 and x.shape[1] >= ref_seq_len:
+            x = x[:, ref_seq_len:, :]
+            if (isinstance(embedded_timestep, torch.Tensor)
+                    and embedded_timestep.dim() >= 2
+                    and embedded_timestep.shape[1] >= ref_seq_len):
+                embedded_timestep = embedded_timestep[:, ref_seq_len:, ...]
+            # Prevent the instance-level unpatchify wrapper from stripping
+            # the same prefix a second time.
+            self._pending_ref_seq_len = 0
+        else:
+            _log(f"  ⚠ output prefix strip skipped: x shape="
+                 f"{getattr(x, 'shape', None)}, ref_seq_len={ref_seq_len}")
+    return _ORIGINAL_PROCESS_OUTPUT(self, x, embedded_timestep, keyframe_idxs, **kwargs)
+
+
 def _describe_slot(obj, idx, prefix="    "):
     """Diagnostic: print shapes of all tensors inside a result slot.
 
@@ -1064,7 +1091,8 @@ def _apply_patchifier_wrap(model_instance):
 
 def apply_global_patches():
     """Apply class-level patches to LTXAVModel. Idempotent."""
-    global _PATCHES_APPLIED, _ORIGINAL_PROCESS_INPUT, _ORIGINAL_PREPARE_TIMESTEP, _PATCH_ERROR
+    global _PATCHES_APPLIED, _ORIGINAL_PROCESS_INPUT
+    global _ORIGINAL_PREPARE_TIMESTEP, _ORIGINAL_PROCESS_OUTPUT, _PATCH_ERROR
 
     if _PATCHES_APPLIED:
         return True
@@ -1072,12 +1100,15 @@ def apply_global_patches():
     try:
         av_module, _model_module, _coords_fn = _import_comfy()
         LTXAVModel = av_module.LTXAVModel
+        LTXVModel = _model_module.LTXVModel
 
         _ORIGINAL_PROCESS_INPUT = LTXAVModel._process_input
         _ORIGINAL_PREPARE_TIMESTEP = LTXAVModel._prepare_timestep
+        _ORIGINAL_PROCESS_OUTPUT = LTXVModel._process_output
 
         LTXAVModel._process_input = _patched_process_input
         LTXAVModel._prepare_timestep = _patched_prepare_timestep
+        LTXVModel._process_output = _patched_process_output
 
         # v2: patch _prepare_positional_embeddings on LTXAVModel itself.
         # Prior code walked MRO to find first owner, but if LTXAVModel overrides
