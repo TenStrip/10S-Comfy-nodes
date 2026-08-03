@@ -146,6 +146,7 @@ METADATA_KEY = "_10s_likeness_reference"
 # Sentinels for hook coexistence with other 10S nodes
 HOOK_ATTR_ATTN1 = "_10s_likeness_anchor_attn1_hook"
 HOOK_ATTR_BACKBONE = "_10s_likeness_anchor_backbone_hook"
+HOOK_ATTR_BACKBONE_HANDLE = "_10s_likeness_anchor_backbone_handle"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +245,54 @@ def _find_backbone(model):
     # Fallback: model itself
     if hasattr(model, "transformer_blocks"):
         return model
+    return None
+
+
+def _extract_video_latent(args, kwargs):
+    """Pull the 5D video latent out of LTXAVModel.forward's arguments.
+
+    LTX-AV passes ``x`` as a video+audio container, NOT a bare tensor —
+    ``separate_audio_and_video_latents`` indexes it as ``x[0]`` / ``x[1]``, and
+    ``recombine_audio_and_video_latents`` returns a plain ``[vx, ax]`` list. A
+    "first 5D tensor in args/kwargs" scan therefore never sees the video latent;
+    the only 5D tensor usually present is ``denoise_mask`` (B, 1, F, H, W), whose
+    F/H/W happen to match, so the scan appears to work on i2v graphs while
+    silently capturing nothing on graphs that pass no mask.
+
+    Resolution order: the ``x`` argument (unwrapped), then a 5D scan that
+    explicitly excludes ``denoise_mask``/``concat_mask`` as a last resort.
+    Returns a 5D tensor or None.
+    """
+    def _unwrap(obj, depth=0):
+        if obj is None or depth > 2:
+            return None
+        if isinstance(obj, torch.Tensor):
+            return obj if obj.dim() == 5 else None
+        # NestedTensor-style wrapper: .tensors == [video, audio]
+        inner = getattr(obj, "tensors", None)
+        if inner is not None and not isinstance(inner, torch.Tensor):
+            try:
+                return _unwrap(inner[0], depth + 1)
+            except (IndexError, TypeError):
+                return None
+        if isinstance(obj, (list, tuple)) and obj:
+            return _unwrap(obj[0], depth + 1)
+        return None
+
+    # 1. The x argument — keyword form first, then first positional.
+    x = kwargs.get("x")
+    if x is None and args:
+        x = args[0]
+    found = _unwrap(x)
+    if found is not None:
+        return found
+
+    # 2. Last-resort scan, excluding mask tensors that would give false dims.
+    for key, v in kwargs.items():
+        if key in ("denoise_mask", "concat_mask"):
+            continue
+        if isinstance(v, torch.Tensor) and v.dim() == 5:
+            return v
     return None
 
 
@@ -440,8 +489,20 @@ class LTXLikenessAnchor:
                             n_removed += 1
                         except AttributeError:
                             pass
-                # Also clear backbone pre-hook sentinel so a future apply can
-                # cleanly re-register
+                # Also detach the backbone pre-hook and clear its sentinel so a
+                # future apply can cleanly re-register. Dropping the sentinel
+                # alone would leave the hook itself attached and firing.
+                prior_bb = getattr(backbone, HOOK_ATTR_BACKBONE_HANDLE, None)
+                if prior_bb is not None:
+                    try:
+                        prior_bb.remove()
+                        n_removed += 1
+                    except Exception:
+                        pass
+                    try:
+                        delattr(backbone, HOOK_ATTR_BACKBONE_HANDLE)
+                    except AttributeError:
+                        pass
                 if getattr(backbone, HOOK_ATTR_BACKBONE, False):
                     try:
                         delattr(backbone, HOOK_ATTR_BACKBONE)
@@ -554,26 +615,48 @@ class LTXLikenessAnchor:
                         state["current_sigma"] = float(sigmas_in)
                 except Exception:
                     pass
-            # Capture the latent shape from the first 5D tensor in args/kwargs
-            # — frame_0 mode needs this to find dims at runtime
+            # Capture the video latent shape — frame_0 mode discovers its dims
+            # from it at runtime.
             if effective_source == "latent_frame_0":
                 try:
-                    candidates = []
-                    for a in args:
-                        if isinstance(a, torch.Tensor) and a.dim() == 5:
-                            candidates.append(a)
-                    for v in kwargs.values():
-                        if isinstance(v, torch.Tensor) and v.dim() == 5:
-                            candidates.append(v)
-                    if candidates:
-                        # Use the first 5D tensor — typically the latent input
-                        state["captured_latent_shape"] = tuple(candidates[0].shape)
-                except Exception:
-                    pass
+                    vlat = _extract_video_latent(args, kwargs)
+                    if vlat is not None:
+                        state["captured_latent_shape"] = tuple(vlat.shape)
+                    elif debug and not state.get("latent_warned"):
+                        state["latent_warned"] = True
+                        print("→ [10S] LikenessAnchor: ⚠ could not "
+                              "locate the 5D video latent in the backbone "
+                              "forward args; dim discovery will fail and the "
+                              "node will be a no-op.")
+                except Exception as e:
+                    if debug and not state.get("latent_warned"):
+                        state["latent_warned"] = True
+                        print(f"→ [10S] LikenessAnchor: ⚠ latent "
+                              f"extraction raised {type(e).__name__}: {e}")
 
-        if not getattr(backbone, HOOK_ATTR_BACKBONE, False):
-            backbone.register_forward_pre_hook(backbone_pre_hook, with_kwargs=True)
-            setattr(backbone, HOOK_ATTR_BACKBONE, True)
+        # Always re-register the backbone pre-hook, removing any prior one.
+        # The sentinel lives on the backbone module, which model.clone() shares
+        # by reference, so gating registration on it meant that from the second
+        # apply onward in a single ComfyUI process the FIRST apply's closure
+        # stayed attached — writing into a dead state dict, leaving this run's
+        # captured_latent_shape (and current_sigma) permanently None, and
+        # silently disabling latent_frame_0 plus the skip_when_sigma_above gate
+        # in every mode.
+        prior_bb = getattr(backbone, HOOK_ATTR_BACKBONE_HANDLE, None)
+        if prior_bb is not None:
+            try:
+                prior_bb.remove()
+            except Exception:
+                pass
+            try:
+                delattr(backbone, HOOK_ATTR_BACKBONE_HANDLE)
+            except AttributeError:
+                pass
+        bb_handle = backbone.register_forward_pre_hook(
+            backbone_pre_hook, with_kwargs=True
+        )
+        setattr(backbone, HOOK_ATTR_BACKBONE_HANDLE, bb_handle)
+        setattr(backbone, HOOK_ATTR_BACKBONE, True)
 
         # ─── attn1 hook factory ──────────────────────────────────────────────
         def make_attn1_hook(block_idx):
