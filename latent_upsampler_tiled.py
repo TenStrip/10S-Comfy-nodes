@@ -62,24 +62,6 @@ import math
 import torch
 from comfy import model_management
 
-
-
-def _unwrap_model(m):
-    """
-    Reach through ComfyUI wrappers (ModelPatcher, ModelPatcherDynamic) to get
-    the actual torch.nn.Module inside.  PR #15063 wraps upscale models in
-    ModelPatcherDynamic which doesn't expose .parameters() / .to() / .cpu()
-    directly.
-    """
-    for attr in ("model", "diffusion_model"):
-        inner = getattr(m, attr, None)
-        if inner is not None and hasattr(inner, "parameters"):
-            return inner
-    if hasattr(m, "parameters"):
-        return m
-    return m
-
-
 class LTXVLatentUpsamplerTiled:
     """
     Spatially-tiled drop-in replacement for LTXVLatentUpsampler.
@@ -119,9 +101,10 @@ class LTXVLatentUpsamplerTiled:
                               max_size_for_no_tile=32,
                               rotate_for_landscape=False,
                               debug=False):
-        device = model_management.get_torch_device()
-        _upscale_inner = _unwrap_model(upscale_model)
-        model_dtype = next(_upscale_inner.parameters()).dtype
+        # LATENT_UPSCALE_MODEL is a ModelPatcher in current ComfyUI.
+        device = upscale_model.load_device
+        model = upscale_model.model
+        model_dtype = upscale_model.model_dtype()
         latents = samples["samples"]
         input_dtype = latents.dtype
         B, C, F, H, W = latents.shape
@@ -136,16 +119,13 @@ class LTXVLatentUpsamplerTiled:
             overlap = max(1, tile_size - 1)
 
         # Memory estimate — only one tile in memory at a time, plus accumulators
-        memory_required = model_management.module_size(_upscale_inner)
         tile_volume = B * C * F * (tile_size * 2) ** 2
         output_volume = B * C * F * (H * 2) * (W * 2)
-        memory_required += tile_volume * 3000.0
+        memory_required = tile_volume * 3000.0
         memory_required += output_volume * 4.0  # fp32 accumulator
-        model_management.free_memory(memory_required, device)
+        model_management.load_models_gpu([upscale_model], memory_required=memory_required)
 
         try:
-            _upscale_inner.to(device)
-
             # Un-normalize ONCE on full latent (global per-channel statistics)
             latents_dev = latents.to(dtype=model_dtype, device=device)
             latents_un = vae.first_stage_model.per_channel_statistics.un_normalize(latents_dev)
@@ -173,13 +153,13 @@ class LTXVLatentUpsamplerTiled:
                 if debug:
                     print(f"  \u00b7 H={H} W={W} both \u2264 max_size_for_no_tile="
                           f"{max_size_for_no_tile}; using non-tiled path")
-                upsampled = _upscale_inner(latents_un)
+                upsampled = model(latents_un)
             else:
                 if debug:
                     print(f"  \u00b7 tiling triggered: H={H} > {max_size_for_no_tile} "
                           f"or W={W} > {max_size_for_no_tile}")
                 upsampled = self._upsample_tiled(
-                    latents_un, _upscale_inner, tile_size, overlap, debug
+                    latents_un, model, tile_size, overlap, debug
                 )
 
             # Rotate back if we rotated
@@ -191,7 +171,7 @@ class LTXVLatentUpsamplerTiled:
             # Re-normalize ONCE on full output
             upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
         finally:
-            _upscale_inner.cpu()
+            model_management.unload_model_and_clones(upscale_model)
 
         upsampled = upsampled.to(
             dtype=input_dtype,

@@ -98,6 +98,14 @@ targeted identity correction in sequence.
 import torch
 import torch.nn.functional as F
 
+# Shared with LTXLikenessAnchor: LTX-AV hands forward() a video+audio
+# container rather than a bare tensor, so the video latent has to be
+# unwrapped explicitly instead of found by scanning for rank 5.
+try:
+    from .latent_likeness_anchor import _extract_video_latent
+except ImportError:  # standalone (non-package) load, e.g. direct testing
+    from latent_likeness_anchor import _extract_video_latent
+
 
 # ─── Hardcoded constants (LTX2) ──────────────────────────────────────────────
 TRACK_SHARPNESS = 8.0
@@ -695,23 +703,26 @@ class LTXLatentAnchorAware:
         }
 
         # ─── Backbone pre-hook for shape capture ─────────────────────────────
-        def _capture_5d(it, label):
-            for v in it:
-                if torch.is_tensor(v) and v.dim() == 5:
-                    state["latent_shape"] = tuple(v.shape)
+        def backbone_pre_hook_kw(module, args, kwargs):
+            # Previously this scanned args/kwargs for "the first 5D tensor".
+            # That never found the video latent \u2014 LTX-AV passes x as a
+            # [video, audio] container, not a Tensor \u2014 and instead picked up
+            # denoise_mask (B,1,F,H,W), whose F/H/W coincidentally match. On
+            # graphs with no mask nothing was captured and the node silently
+            # did nothing. Resolve the latent explicitly instead.
+            if state["latent_shape"] is None:
+                vlat = _extract_video_latent(args, kwargs)
+                if vlat is not None:
+                    state["latent_shape"] = tuple(vlat.shape)
                     if debug and not state["shape_logged"]:
-                        print(f"  \u00b7 captured 5D latent from {label}: "
+                        print(f"  \u00b7 captured video latent: "
                               f"{state['latent_shape']}")
                         state["shape_logged"] = True
-                    return True
-            return False
-
-        def backbone_pre_hook_kw(module, args, kwargs):
-            if state["latent_shape"] is None:
-                if args:
-                    _capture_5d(args, "args")
-                if state["latent_shape"] is None and kwargs:
-                    _capture_5d(kwargs.values(), "kwargs")
+                elif debug and not state["shape_logged"]:
+                    state["shape_logged"] = True
+                    print("  \u00b7 \u26a0 could not locate the 5D video "
+                          "latent in the backbone forward args; the anchor "
+                          "will be inactive.")
             return None
 
         def backbone_pre_hook_args_only(module, args):
@@ -766,7 +777,18 @@ class LTXLatentAnchorAware:
 
         # ─── Core blend (matching identical to v1.4, energy modulation added) ─
         def _apply_blend(tensor, block_idx, depth_mult):
-            B, seq, D = tensor.shape
+            B, full_seq, D = tensor.shape
+            prefix_seq_len = int(
+                getattr(backbone, "_pending_ref_seq_len", 0) or 0
+            )
+            has_prefix = 0 < prefix_seq_len < full_seq
+            prefix_tensor = (
+                tensor[:, :prefix_seq_len] if has_prefix else None
+            )
+            target_tensor = (
+                tensor[:, prefix_seq_len:] if has_prefix else tensor
+            )
+            B, seq, D = target_tensor.shape
             _, _, F_lat, H_lat, W_lat = state["latent_shape"]
             F_tok = max(1, F_lat // TEMPORAL_PATCH)
             H_tok = max(1, H_lat // SPATIAL_PATCH)
@@ -799,7 +821,7 @@ class LTXLatentAnchorAware:
                       f"K={K} (whole anchor frame)")
                 state["hook_logged"] = True
 
-            grid = _to_grid(tensor, B, F_tok, H_tok, W_tok, D)
+            grid = _to_grid(target_tensor, B, F_tok, H_tok, W_tok, D)
 
             # Per-frame strength schedule
             if F_tok > 1 and decay_with_distance > 0.0:
@@ -963,7 +985,13 @@ class LTXLatentAnchorAware:
                           f"{type(_e).__name__}: {_e}")
             state["calls"] += 1
 
-            return _from_grid(grid_modified, B, F_tok, H_tok, W_tok, D, seq)
+            new_target_tensor = _from_grid(
+                grid_modified, B, F_tok, H_tok, W_tok, D, seq
+            )
+            return (
+                torch.cat([prefix_tensor, new_target_tensor], dim=1)
+                if has_prefix else new_target_tensor
+            )
 
         def make_attn1_hook(block_idx):
             depth_mult = _depth_multiplier(depth_curve, block_idx, n_blocks)

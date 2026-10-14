@@ -146,6 +146,7 @@ METADATA_KEY = "_10s_likeness_reference"
 # Sentinels for hook coexistence with other 10S nodes
 HOOK_ATTR_ATTN1 = "_10s_likeness_anchor_attn1_hook"
 HOOK_ATTR_BACKBONE = "_10s_likeness_anchor_backbone_hook"
+HOOK_ATTR_BACKBONE_HANDLE = "_10s_likeness_anchor_backbone_handle"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,6 +248,54 @@ def _find_backbone(model):
     return None
 
 
+def _extract_video_latent(args, kwargs):
+    """Pull the 5D video latent out of LTXAVModel.forward's arguments.
+
+    LTX-AV passes ``x`` as a video+audio container, NOT a bare tensor —
+    ``separate_audio_and_video_latents`` indexes it as ``x[0]`` / ``x[1]``, and
+    ``recombine_audio_and_video_latents`` returns a plain ``[vx, ax]`` list. A
+    naive "first 5D tensor in args/kwargs" scan therefore never sees the video
+    latent at all; the only 5D tensor usually present is ``denoise_mask``
+    (B, 1, F, H, W), which happens to carry matching F/H/W and so masks the bug
+    on i2v graphs while silently no-op'ing on T2V graphs that pass no mask.
+
+    Resolution order: the ``x`` argument (unwrapped), then a 5D scan that
+    explicitly excludes ``denoise_mask``/``concat_mask`` as a last resort.
+    Returns a 5D tensor or None.
+    """
+    def _unwrap(obj, depth=0):
+        if obj is None or depth > 2:
+            return None
+        if isinstance(obj, torch.Tensor):
+            return obj if obj.dim() == 5 else None
+        # NestedTensor-style wrapper: .tensors == [video, audio]
+        inner = getattr(obj, "tensors", None)
+        if inner is not None and not isinstance(inner, torch.Tensor):
+            try:
+                return _unwrap(inner[0], depth + 1)
+            except (IndexError, TypeError):
+                return None
+        if isinstance(obj, (list, tuple)) and obj:
+            return _unwrap(obj[0], depth + 1)
+        return None
+
+    # 1. The x argument — keyword form first, then first positional.
+    x = kwargs.get("x")
+    if x is None and args:
+        x = args[0]
+    found = _unwrap(x)
+    if found is not None:
+        return found
+
+    # 2. Last-resort scan, excluding mask tensors that would give false dims.
+    for key, v in kwargs.items():
+        if key in ("denoise_mask", "concat_mask"):
+            continue
+        if isinstance(v, torch.Tensor) and v.dim() == 5:
+            return v
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,7 +332,7 @@ class LTXLikenessAnchor:
                                "where frame_0 is already the conditioning).",
                 }),
                 "reference_source": (
-                    ["auto", "guide", "latent_frame_0"],
+                    ["auto", "guide", "latent_frame_0", "reference_prefix"],
                     {
                         "default": "auto",
                         "tooltip": "auto: use guide if reference_info wired, "
@@ -295,15 +344,20 @@ class LTXLikenessAnchor:
                                    "the latent as the reference. Avoids the "
                                    "end-keyframe interpolation issue; ideal "
                                    "for i2v workflows where frame_0 is the "
-                                   "conditioned start image.",
+                                   "conditioned start image. "
+                                   "reference_prefix: use tokens prepended by "
+                                   "LTX Reference Conditioning as the identity "
+                                   "reference and modify only target-video "
+                                   "tokens.",
                     },
                 ),
                 "frame_0_bbox": ("STRING", {
                     "default": "",
-                    "tooltip": "When reference_source=latent_frame_0: bbox "
-                               "within frame_0 to use as identity source. "
+                    "tooltip": "When reference_source=latent_frame_0 or "
+                               "reference_prefix: bbox within the selected "
+                               "reference to use as identity source. "
                                "Format: 'x1,y1,x2,y2' normalized 0-1. "
-                               "Empty = whole frame_0 used as reference.",
+                               "Empty = whole reference used.",
                 }),
                 "similarity_threshold": ("FLOAT", {
                     "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -383,11 +437,13 @@ class LTXLikenessAnchor:
     CATEGORY = "10S Nodes/Identity"
     DESCRIPTION = (
         "Per-block attention pull toward reference features for identity "
-        "preservation. Two modes: (1) wire reference_info from LikenessGuide "
+        "preservation. Supports: (1) wire reference_info from LikenessGuide "
         "to use Guide's appended reference frame. (2) leave reference_info "
         "unconnected and the node uses frame_0 of the latent as reference — "
         "ideal for i2v workflows where frame_0 is the conditioning start "
-        "image. v1.2 uses directional pull mode (preserves color)."
+        "image. reference_prefix mode uses LTX Reference Conditioning's "
+        "prepended tokens directly. v1.2 uses directional pull mode "
+        "(preserves color)."
     )
 
     def apply(self, model, strength,
@@ -440,8 +496,20 @@ class LTXLikenessAnchor:
                             n_removed += 1
                         except AttributeError:
                             pass
-                # Also clear backbone pre-hook sentinel so a future apply can
-                # cleanly re-register
+                # Also detach the backbone pre-hook and clear its sentinel so a
+                # future apply can cleanly re-register. Dropping the sentinel
+                # alone would leave the hook itself attached and firing.
+                prior_bb = getattr(backbone, HOOK_ATTR_BACKBONE_HANDLE, None)
+                if prior_bb is not None:
+                    try:
+                        prior_bb.remove()
+                        n_removed += 1
+                    except Exception:
+                        pass
+                    try:
+                        delattr(backbone, HOOK_ATTR_BACKBONE_HANDLE)
+                    except AttributeError:
+                        pass
                 if getattr(backbone, HOOK_ATTR_BACKBONE, False):
                     try:
                         delattr(backbone, HOOK_ATTR_BACKBONE)
@@ -504,6 +572,8 @@ class LTXLikenessAnchor:
             if effective_source == "guide":
                 print(f"  \u00b7 F_orig={F_orig} F_total={F_total} F_ref={F_ref}")
                 print(f"  \u00b7 latent dims H={H_latent} W={W_latent}")
+            elif effective_source == "reference_prefix":
+                print(f"  \u00b7 reference prefix: dims discovered at runtime")
             else:
                 print(f"  \u00b7 frame_0 mode: dims discovered at runtime")
             print(f"  \u00b7 face_bbox='{face_bbox or '<none — full reference>'}'")
@@ -540,6 +610,8 @@ class LTXLikenessAnchor:
             "call_count": 0,
             "skipped_count": 0,
             "captured_latent_shape": None,  # for frame_0 mode
+            "fired": False,        # one-shot HOOK ACTIVE announcement
+            "exits_seen": set(),   # early-exit reasons already reported
         }
 
         # ─── Backbone pre-hook: capture sigma and latent shape ──────────────
@@ -554,26 +626,48 @@ class LTXLikenessAnchor:
                         state["current_sigma"] = float(sigmas_in)
                 except Exception:
                     pass
-            # Capture the latent shape from the first 5D tensor in args/kwargs
-            # — frame_0 mode needs this to find dims at runtime
-            if effective_source == "latent_frame_0":
+            # Capture the video latent shape — frame_0 and reference_prefix
+            # modes discover their dims from it at runtime.
+            if effective_source in ("latent_frame_0", "reference_prefix"):
                 try:
-                    candidates = []
-                    for a in args:
-                        if isinstance(a, torch.Tensor) and a.dim() == 5:
-                            candidates.append(a)
-                    for v in kwargs.values():
-                        if isinstance(v, torch.Tensor) and v.dim() == 5:
-                            candidates.append(v)
-                    if candidates:
-                        # Use the first 5D tensor — typically the latent input
-                        state["captured_latent_shape"] = tuple(candidates[0].shape)
-                except Exception:
-                    pass
+                    vlat = _extract_video_latent(args, kwargs)
+                    if vlat is not None:
+                        state["captured_latent_shape"] = tuple(vlat.shape)
+                    elif debug and "no_latent" not in state["exits_seen"]:
+                        state["exits_seen"].add("no_latent")
+                        print("→ [10S] LikenessAnchor: ⚠ could not "
+                              "locate the 5D video latent in the backbone "
+                              "forward args; dim discovery will fail and the "
+                              "node will be a no-op.")
+                except Exception as e:
+                    if debug and "latent_exc" not in state["exits_seen"]:
+                        state["exits_seen"].add("latent_exc")
+                        print(f"→ [10S] LikenessAnchor: ⚠ latent "
+                              f"extraction raised {type(e).__name__}: {e}")
 
-        if not getattr(backbone, HOOK_ATTR_BACKBONE, False):
-            backbone.register_forward_pre_hook(backbone_pre_hook, with_kwargs=True)
-            setattr(backbone, HOOK_ATTR_BACKBONE, True)
+        # Always re-register the backbone pre-hook, removing any prior one.
+        # The sentinel lives on the backbone module, which model.clone() shares
+        # by reference, so gating registration on it meant that from the second
+        # run onward in a single ComfyUI process the FIRST run's closure stayed
+        # attached — writing into a dead state dict, leaving this run's
+        # captured_latent_shape (and current_sigma) permanently None, and
+        # silently disabling latent_frame_0/reference_prefix plus the
+        # skip_when_sigma_above gate in every mode.
+        prior_bb = getattr(backbone, HOOK_ATTR_BACKBONE_HANDLE, None)
+        if prior_bb is not None:
+            try:
+                prior_bb.remove()
+            except Exception:
+                pass
+            try:
+                delattr(backbone, HOOK_ATTR_BACKBONE_HANDLE)
+            except AttributeError:
+                pass
+        bb_handle = backbone.register_forward_pre_hook(
+            backbone_pre_hook, with_kwargs=True
+        )
+        setattr(backbone, HOOK_ATTR_BACKBONE_HANDLE, bb_handle)
+        setattr(backbone, HOOK_ATTR_BACKBONE, True)
 
         # ─── attn1 hook factory ──────────────────────────────────────────────
         def make_attn1_hook(block_idx):
@@ -590,6 +684,21 @@ class LTXLikenessAnchor:
                 depth_scale = depth_scale * (1.0 - falloff)
 
             def hook(module, inputs, output):
+                def _bail(reason, detail=""):
+                    """Early-exit with a once-per-reason debug explanation.
+
+                    Without this every failure mode (bad bbox, spatial
+                    mismatch, missing prefix) is indistinguishable from a
+                    working run — the node just silently returns the input.
+                    """
+                    if debug and reason not in state["exits_seen"]:
+                        state["exits_seen"].add(reason)
+                        suffix = f" ({detail})" if detail else ""
+                        print(f"→ [10S] LikenessAnchor: ⚠ inactive — "
+                              f"{reason}{suffix} [blk {block_idx:02d}, "
+                              f"source={effective_source}]")
+                    return output
+
                 if bypass:
                     return output
 
@@ -602,19 +711,60 @@ class LTXLikenessAnchor:
 
                 tensor, wrap = _extract_attn_tensor(output)
                 if not isinstance(tensor, torch.Tensor) or tensor.dim() != 3:
-                    return output
+                    return _bail("attn output is not a 3D tensor")
 
-                B, seq, D = tensor.shape
+                B, full_seq, D = tensor.shape
+                prefix_seq_len = int(
+                    getattr(backbone, "_pending_ref_seq_len", 0) or 0
+                )
+                has_prefix = 0 < prefix_seq_len < full_seq
+                prefix_tensor = (
+                    tensor[:, :prefix_seq_len] if has_prefix else None
+                )
+                target_tensor = (
+                    tensor[:, prefix_seq_len:] if has_prefix else tensor
+                )
+                B, seq, D = target_tensor.shape
 
                 # ── Discover or use known latent dims ────────────────────────
-                if effective_source == "guide":
+                if effective_source == "reference_prefix":
+                    if not has_prefix:
+                        return _bail(
+                            "no reference prefix present",
+                            "wire LTX Reference Conditioning + Reference "
+                            "Enable ahead of this node")
+                    captured_shape = state.get("captured_latent_shape")
+                    if captured_shape is None:
+                        return _bail("video latent shape was never captured")
+                    _, _, F_cap, H_cap, W_cap = captured_shape
+                    spatial_dim = H_cap * W_cap
+                    if spatial_dim <= 0 or F_cap * spatial_dim != seq:
+                        return _bail(
+                            "latent shape does not match token count",
+                            f"F*H*W={F_cap}*{H_cap}*{W_cap}="
+                            f"{F_cap * spatial_dim} vs seq={seq}")
+                    if prefix_seq_len % spatial_dim != 0:
+                        return _bail(
+                            "prefix is not a whole number of frames",
+                            f"prefix={prefix_seq_len} spatial={spatial_dim}")
+                    F_actual, H_use, W_use = F_cap, H_cap, W_cap
+                    F_prefix = prefix_seq_len // spatial_dim
+                    if F_prefix < 1:
+                        return _bail("reference prefix is under one frame")
+                    F_gen_start, F_gen_end = 0, F_actual
+                    F_ref_start = F_ref_end = 0
+                elif effective_source == "guide":
                     # Use known H_latent, W_latent from metadata; infer F
                     spatial_dim = H_latent * W_latent
                     if spatial_dim <= 0 or seq % spatial_dim != 0:
-                        return output
+                        return _bail(
+                            "sequence is not divisible by metadata spatial dims",
+                            f"seq={seq} H*W={H_latent}*{W_latent}={spatial_dim}")
                     F_actual = seq // spatial_dim
                     if F_actual < F_orig + 1:
-                        return output
+                        return _bail(
+                            "not enough frames for guide reference",
+                            f"F_actual={F_actual} needs >{F_orig}")
                     H_use, W_use = H_latent, W_latent
                     # Generated = first F_orig frames; reference = remainder
                     F_gen_start, F_gen_end = 0, F_orig
@@ -628,25 +778,36 @@ class LTXLikenessAnchor:
                         if F_cap * H_cap * W_cap == seq:
                             F_actual, H_use, W_use = F_cap, H_cap, W_cap
                         else:
-                            # Captured shape doesn't match — skip
-                            return output
+                            return _bail(
+                                "captured latent shape does not match tokens",
+                                f"F*H*W={F_cap}*{H_cap}*{W_cap}="
+                                f"{F_cap * H_cap * W_cap} vs seq={seq}")
                     else:
-                        # No captured shape; cannot determine dims
-                        return output
+                        return _bail("video latent shape was never captured")
                     if F_actual < 2:
-                        return output  # need at least 1 ref + 1 gen frame
+                        return _bail(
+                            "need at least 2 frames (1 reference + 1 generated)",
+                            f"F_actual={F_actual}")
                     # Frame 0 = reference; frames 1..F_actual-1 = generated
                     F_gen_start, F_gen_end = 1, F_actual
                     F_ref_start, F_ref_end = 0, 1
 
                 try:
-                    grid = tensor.view(B, F_actual, H_use, W_use, D)
-                except RuntimeError:
-                    return output
+                    grid = target_tensor.view(B, F_actual, H_use, W_use, D)
+                except RuntimeError as e:
+                    return _bail("target tensor view failed", str(e))
 
                 F_gen_count = F_gen_end - F_gen_start
                 gen_grid = grid[:, F_gen_start:F_gen_end]
-                ref_grid = grid[:, F_ref_start:F_ref_end]
+                if effective_source == "reference_prefix":
+                    try:
+                        ref_grid = prefix_tensor.view(
+                            B, F_prefix, H_use, W_use, D
+                        )
+                    except RuntimeError as e:
+                        return _bail("prefix tensor view failed", str(e))
+                else:
+                    ref_grid = grid[:, F_ref_start:F_ref_end]
 
                 # Apply bbox within reference
                 h1, h2, w1, w2 = _parse_bbox_to_indices(
@@ -655,8 +816,25 @@ class LTXLikenessAnchor:
                 ref_sub = ref_grid[:, :, h1:h2, w1:w2, :]
                 R_count = ref_sub.shape[1] * ref_sub.shape[2] * ref_sub.shape[3]
                 if R_count == 0:
-                    return output
+                    return _bail(
+                        "face_bbox selects zero reference tokens",
+                        f"bbox='{face_bbox}' -> h[{h1}:{h2}] w[{w1}:{w2}] "
+                        f"in {H_use}x{W_use} grid")
                 ref_tokens = ref_sub.reshape(B, R_count, D)
+
+                if not state["fired"]:
+                    state["fired"] = True
+                    print(f"→ [10S] LikenessAnchor: HOOK ACTIVE | "
+                          f"first fire on blk{block_idx} | "
+                          f"source={effective_source} "
+                          f"grid=(F={F_actual},H={H_use},W={W_use}) "
+                          f"seq={seq} D={D} | "
+                          f"ref_tokens={R_count}"
+                          + (f" prefix={prefix_seq_len}({F_prefix}f)"
+                             if effective_source == "reference_prefix" else "")
+                          + f" | strength={strength} "
+                          f"sim_thr={similarity_threshold} "
+                          f"pull={pull_mode}")
 
                 # ── Centered features for cosine similarity ──────────────────
                 work_dtype = torch.float32
@@ -752,11 +930,23 @@ class LTXLikenessAnchor:
                     B, F_gen_count, H_use, W_use, D
                 )
 
-                # Reassemble: modified generated frames + unchanged reference
-                new_grid = grid.clone()
-                new_grid[:, F_gen_start:F_gen_end] = new_gen_grid
-                # Reference portion stays at grid[:, F_ref_start:F_ref_end]
-                new_tensor = new_grid.reshape(B, seq, D)
+                # Reassemble: modified generated frames + unchanged reference.
+                # When the generated range covers every frame (reference_prefix
+                # mode, where the reference lives in the prefix rather than in
+                # the grid), the clone would be overwritten in full — skip it.
+                # At LTX-AV sizes that clone is ~70MB per block, ~3.5GB of
+                # pointless alloc/free churn per forward across 48 blocks.
+                if F_gen_count == F_actual:
+                    new_grid = new_gen_grid
+                else:
+                    new_grid = grid.clone()
+                    new_grid[:, F_gen_start:F_gen_end] = new_gen_grid
+                    # Reference portion stays at grid[:, F_ref_start:F_ref_end]
+                new_target_tensor = new_grid.reshape(B, seq, D)
+                new_tensor = (
+                    torch.cat([prefix_tensor, new_target_tensor], dim=1)
+                    if has_prefix else new_target_tensor
+                )
 
                 state["call_count"] += 1
                 if debug and state["call_count"] % 96 == 0:
