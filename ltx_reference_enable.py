@@ -537,7 +537,13 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
     #   1. kwargs directly (Comfy unpacks model_options["transformer_options"]
     #      into kwargs at the top level — this is how it arrives in practice)
     #   2. nested transformer_options dict (for paths that pass it as-is)
-    #   3. attribute side-channel (fallback only, leaks across model clones)
+    #   3. legacy attribute side-channel, only when no explicit keys exist
+    # Explicit None disables this fallback. Preserve non-None alias precedence
+    # so legacy callers can re-enable memory_video after a local bypass.
+    reference_keys = ("reference_latent", "memory_video")
+    has_reference_options = any(key in kwargs for key in reference_keys)
+    if isinstance(transformer_options, dict):
+        has_reference_options |= any(key in transformer_options for key in reference_keys)
     reference_latent = kwargs.get("reference_latent")
     if reference_latent is None:
         reference_latent = kwargs.get("memory_video")  # legacy key
@@ -545,7 +551,7 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
         reference_latent = transformer_options.get("reference_latent")
         if reference_latent is None:
             reference_latent = transformer_options.get("memory_video")
-    if reference_latent is None:
+    if reference_latent is None and not has_reference_options:
         reference_latent = getattr(self, "_ltx_reference_latent", None)
         if reference_latent is None:
             reference_latent = getattr(self, "_echo_memory_video", None)

@@ -52,6 +52,23 @@ def _pad_image_to_multiple(image_bhwc: torch.Tensor, divisor: int = 32) -> torch
     return x.permute(0, 2, 3, 1).contiguous()
 
 
+def _without_reference(model):
+    """Disable reference on this clone without changing the shared backbone."""
+    model = model.clone()
+    if not hasattr(model, "model_options") or model.model_options is None:
+        model.model_options = {}
+    options = model.model_options.get("transformer_options")
+    if options is None:
+        options = {}
+        model.model_options["transformer_options"] = options
+    # Explicit None prevents legacy shared-state fallback, including on cache hits.
+    options["reference_latent"] = None
+    options["memory_video"] = None
+    options.pop("reference_position_mode", None)
+    options.pop("memory_position_mode", None)
+    return model
+
+
 class LTXReferenceConditioning:
     """Encode an image to a reference latent and attach to MODEL."""
 
@@ -119,26 +136,9 @@ class LTXReferenceConditioning:
 
     def attach(self, model, vae, image, target_latent=None,
                strength=1.0, position_mode="reference", verbose=False):
-        # Bypass + clear state
         if strength == 0.0:
             print("[LTX Reference Conditioning] strength=0, bypassing and clearing state.")
-            model = model.clone()
-            if hasattr(model, "model_options") and isinstance(model.model_options, dict):
-                to = model.model_options.get("transformer_options")
-                if isinstance(to, dict):
-                    to.pop("reference_latent", None)
-                    to.pop("reference_position_mode", None)
-                    # Backwards compat: also clear old Echo-branded keys
-                    to.pop("memory_video", None)
-                    to.pop("memory_position_mode", None)
-            try:
-                dm = model.model.diffusion_model
-                for attr in ("_ltx_reference_latent", "_echo_memory_video"):
-                    if hasattr(dm, attr):
-                        delattr(dm, attr)
-            except Exception:
-                pass
-            return (model,)
+            return (_without_reference(model),)
 
         # Standard Comfy IMAGE format
         if image.shape[-1] > 3:
@@ -285,7 +285,7 @@ class LTXReferenceConditioning:
                 f"This may indicate a mismatched VAE."
             )
 
-        # Clone model and attach via BOTH channels for reliability
+        # Attach only to clone-local options; the backbone is shared by clones.
         model = model.clone()
         if not hasattr(model, "model_options") or model.model_options is None:
             model.model_options = {}
@@ -297,14 +297,6 @@ class LTXReferenceConditioning:
         # model still finds the latent
         model.model_options["transformer_options"]["memory_video"] = reference_latent
         model.model_options["transformer_options"]["memory_position_mode"] = position_mode
-
-        try:
-            dm = model.model.diffusion_model
-            dm._ltx_reference_latent = reference_latent
-            dm._echo_memory_video = reference_latent  # backwards compat
-        except Exception as e:
-            print(f"[LTX Reference Conditioning] Warning: couldn't set "
-                  f"attribute side-channel: {e}")
 
         if verbose:
             print(
@@ -427,9 +419,8 @@ class LTXReferenceBypass:
     then route the MODEL through Bypass before an upscale/refinement
     sampler where you want the model running clean.
 
-    This clears the reference latent from BOTH model_options and the
-    diffusion_model attribute side-channel, so downstream Enable patches
-    see no reference and act as passthrough.
+    This explicitly disables reference in this clone's model_options.
+    Shared backbone state and reference-enabled sibling clones are unchanged.
     """
 
     @classmethod
@@ -450,27 +441,7 @@ class LTXReferenceBypass:
     )
 
     def bypass(self, model):
-        model = model.clone()
-        # Clear from model_options.transformer_options
-        if hasattr(model, "model_options") and isinstance(model.model_options, dict):
-            to = model.model_options.get("transformer_options")
-            if isinstance(to, dict):
-                for k in ("reference_latent", "reference_position_mode",
-                          "memory_video", "memory_position_mode"):
-                    to.pop(k, None)
-        # Clear attribute side-channel from diffusion_model
-        try:
-            dm = model.model.diffusion_model
-            for attr in ("_ltx_reference_latent", "_echo_memory_video",
-                          "_pending_ref_seq_len", "_pending_ref_frames",
-                          "_pending_memory_seq_len", "_pending_memory_frames"):
-                if hasattr(dm, attr):
-                    try:
-                        delattr(dm, attr)
-                    except Exception:
-                        setattr(dm, attr, None)
-        except Exception:
-            pass
+        model = _without_reference(model)
         print("[LTX Reference Bypass] Cleared reference state from MODEL.")
         return (model,)
 
@@ -555,25 +526,9 @@ class LTXReferenceSequenceConditioning:
     def attach(self, model, vae, images, target_latent=None,
                start_frame=0, num_frames=9, strength=1.0,
                position_mode="reference", verbose=False):
-        # Bypass + clear state
         if strength == 0.0:
             print("[LTX Reference Sequence] strength=0, bypassing and clearing state.")
-            model = model.clone()
-            if hasattr(model, "model_options") and isinstance(model.model_options, dict):
-                to = model.model_options.get("transformer_options")
-                if isinstance(to, dict):
-                    to.pop("reference_latent", None)
-                    to.pop("reference_position_mode", None)
-                    to.pop("memory_video", None)
-                    to.pop("memory_position_mode", None)
-            try:
-                dm = model.model.diffusion_model
-                for attr in ("_ltx_reference_latent", "_echo_memory_video"):
-                    if hasattr(dm, attr):
-                        delattr(dm, attr)
-            except Exception:
-                pass
-            return (model,)
+            return (_without_reference(model),)
 
         # Validate input shape
         if images.dim() != 4:
@@ -725,26 +680,19 @@ class LTXReferenceSequenceConditioning:
         if strength != 1.0:
             reference_latent = reference_latent * strength
 
-        # Attach via dual channel (model_options + diffusion_model attribute)
+        # Attach to clone-local options, never to the shared diffusion model.
         model = model.clone()
-        if hasattr(model, "model_options") and isinstance(model.model_options, dict):
-            to = model.model_options.setdefault("transformer_options", {})
-            if isinstance(to, dict):
-                to["reference_latent"] = reference_latent
-                to["reference_position_mode"] = position_mode
-                # Backwards compat keys
-                to["memory_video"] = reference_latent
-                to["memory_position_mode"] = position_mode
-
-        try:
-            dm = model.model.diffusion_model
-            dm._ltx_reference_latent = reference_latent
-            dm._echo_memory_video = reference_latent
-        except Exception as e:
-            print(
-                f"[LTX Reference Sequence] WARN: couldn't set attribute "
-                f"side-channel: {e}"
-            )
+        if not hasattr(model, "model_options") or model.model_options is None:
+            model.model_options = {}
+        to = model.model_options.get("transformer_options")
+        if to is None:
+            to = {}
+            model.model_options["transformer_options"] = to
+        to["reference_latent"] = reference_latent
+        to["reference_position_mode"] = position_mode
+        # Backwards compat keys
+        to["memory_video"] = reference_latent
+        to["memory_position_mode"] = position_mode
 
         if verbose:
             print(
